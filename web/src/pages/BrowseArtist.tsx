@@ -5,6 +5,7 @@ import { api } from '../api/client';
 import { useToast } from '../components/Toast';
 import FilterBar from '../components/FilterBar';
 import MetadataPills from '../components/MetadataPills';
+import LanguageSelector from '../components/LanguageSelector';
 
 export default function BrowseArtist() {
   const { id } = useParams<{ id: string }>();
@@ -13,6 +14,7 @@ export default function BrowseArtist() {
   const navigate = useNavigate();
   const { toast } = useToast();
   const [watchNewReleases, setWatchNewReleases] = useState(false);
+  const [languages, setLanguages] = useState<string[]>([]);
   const [localWatchedAlbums, setLocalWatchedAlbums] = useState<Set<string>>(new Set());
   const [trackFilter, setTrackFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
@@ -26,7 +28,12 @@ export default function BrowseArtist() {
   });
 
   const watchArtist = useMutation({
-    mutationFn: () => api.watchArtist(id!, { watch_new_releases: watchNewReleases, provider: providerOverride }),
+    mutationFn: () =>
+      api.watchArtist(id!, {
+        watch_new_releases: watchNewReleases,
+        languages,
+        provider: providerOverride,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['artists'] });
       navigate('/');
@@ -40,6 +47,7 @@ export default function BrowseArtist() {
         artist_provider_id: artist!.id,
         artist_name: artist!.name,
         artist_image_url: artist!.image_url,
+        languages,
         provider: providerOverride,
       }),
     onSuccess: (_data, albumID) => {
@@ -114,6 +122,10 @@ export default function BrowseArtist() {
             <MetadataPills metadata={artist.metadata} />
           </div>
         </div>
+      </div>
+
+      <div className="mb-2">
+        <LanguageSelector selected={languages} onChange={setLanguages} />
       </div>
 
       <label className="flex items-center justify-between bg-zinc-800/50 rounded-lg px-3 py-2.5 mb-2 cursor-pointer">

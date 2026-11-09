@@ -1,9 +1,17 @@
+FROM node:24-alpine AS frontend
+WORKDIR /web
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM golang:1.26-alpine AS backend
 ARG VERSION=dev
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=frontend /web/dist ./cmd/crate/dist
 RUN CGO_ENABLED=0 go build -ldflags "-X main.Version=${VERSION}" -o /crate ./cmd/crate/ && \
     CGO_ENABLED=0 go build -o /provider-musicbrainz ./cmd/provider-musicbrainz/ && \
     CGO_ENABLED=0 go build -o /provider-deezer ./cmd/provider-deezer/

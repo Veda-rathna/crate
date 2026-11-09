@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/library"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/naming"
@@ -227,12 +228,30 @@ func (s *Server) handleBrowseAlbum(w http.ResponseWriter, r *http.Request) {
 
 // Watch
 
+func cleanLanguages(langs []string) []string {
+	if langs == nil {
+		return []string{}
+	}
+	var cleaned []string
+	for _, l := range langs {
+		norm := language.Normalize(l)
+		if norm != "" && norm != language.All {
+			cleaned = append(cleaned, norm)
+		}
+	}
+	if cleaned == nil {
+		return []string{}
+	}
+	return cleaned
+}
+
 func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 	providerID := chi.URLParam(r, "id")
 
 	var req struct {
-		WatchNewReleases bool   `json:"watch_new_releases"`
-		Provider         string `json:"provider,omitempty"`
+		WatchNewReleases bool     `json:"watch_new_releases"`
+		Provider         string   `json:"provider,omitempty"`
+		Languages        []string `json:"languages,omitempty"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -266,6 +285,11 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.Languages != nil {
+			cleaned := cleanLanguages(req.Languages)
+			_ = s.queries.UpdateArtistLanguages(existing.ID, cleaned)
+			existing.Languages = cleaned
+		}
 
 		albums := albumList.Albums
 		s.bgWork.Add(1)
@@ -285,6 +309,7 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 		ProviderID: providerID,
 		ImageURL:   strPtrOrNil(imgURL),
 		Status:     models.ArtistStatusWatched,
+		Languages:  cleanLanguages(req.Languages),
 	}
 	if req.WatchNewReleases {
 		artist.WatchNewReleases = true
@@ -342,6 +367,18 @@ func (s *Server) syncAlbumTracks(ctx context.Context, providerName string, album
 }
 
 func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string, artistID int64, pa *pb.AlbumSummary) {
+	artist, _ := s.queries.GetArtist(artistID)
+	albumStatus := models.AlbumStatusWatched
+	trackStatus := models.TrackStatusWanted
+
+	if artist != nil && !language.IsAllLanguages(artist.Languages) {
+		summaryLang := language.DetectReleaseSummaryLanguage(pa.Title, pa.Metadata)
+		if summaryLang != language.Unknown && !language.MatchesArtistLanguages(artist.Languages, summaryLang) {
+			albumStatus = models.AlbumStatusIgnored
+			trackStatus = models.TrackStatusIgnored
+		}
+	}
+
 	year := intPtrOrNil(int(pa.Year))
 	cover := pa.CoverUrl
 	album := &models.Album{
@@ -352,7 +389,7 @@ func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string,
 		ProviderID: pa.Id,
 		CoverURL:   strPtrOrNil(cover),
 		RecordType: pa.RecordType,
-		Status:     models.AlbumStatusWatched,
+		Status:     albumStatus,
 	}
 	if err := s.queries.CreateAlbum(album); err != nil {
 		return
@@ -362,6 +399,16 @@ func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string,
 	if err != nil {
 		return
 	}
+
+	if artist != nil && !language.IsAllLanguages(artist.Languages) && albumStatus == models.AlbumStatusWatched {
+		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
+		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+			albumStatus = models.AlbumStatusIgnored
+			trackStatus = models.TrackStatusIgnored
+			_ = s.queries.UpdateAlbumStatus(album.ID, models.AlbumStatusIgnored)
+		}
+	}
+
 	for _, pt := range albumDetail.Tracks {
 		s.queries.CreateTrack(&models.Track{
 			AlbumID:     album.ID,
@@ -371,7 +418,7 @@ func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string,
 			DurationMs:  int(pt.DurationMs),
 			Provider:    providerName,
 			ProviderID:  pt.Id,
-			Status:      models.TrackStatusWanted,
+			Status:      trackStatus,
 		})
 	}
 }
@@ -380,10 +427,11 @@ func (s *Server) handleWatchAlbum(w http.ResponseWriter, r *http.Request) {
 	providerID := chi.URLParam(r, "id")
 
 	var req struct {
-		ArtistProviderID string `json:"artist_provider_id"`
-		ArtistName       string `json:"artist_name"`
-		ArtistImageURL   string `json:"artist_image_url"`
-		Provider         string `json:"provider,omitempty"`
+		ArtistProviderID string   `json:"artist_provider_id"`
+		ArtistName       string   `json:"artist_name"`
+		ArtistImageURL   string   `json:"artist_image_url"`
+		Provider         string   `json:"provider,omitempty"`
+		Languages        []string `json:"languages,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -403,11 +451,16 @@ func (s *Server) handleWatchAlbum(w http.ResponseWriter, r *http.Request) {
 			ProviderID: req.ArtistProviderID,
 			ImageURL:   strPtrOrNil(req.ArtistImageURL),
 			Status:     models.ArtistStatusPartial,
+			Languages:  cleanLanguages(req.Languages),
 		}
 		if err := s.queries.CreateArtist(artist); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to save artist")
 			return
 		}
+	} else if req.Languages != nil {
+		cleaned := cleanLanguages(req.Languages)
+		_ = s.queries.UpdateArtistLanguages(artist.ID, cleaned)
+		artist.Languages = cleaned
 	}
 
 	existingAlbum, _ := s.queries.FindAlbumByProvider(primary, providerID)
@@ -634,6 +687,30 @@ func (s *Server) handleToggleNewReleases(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]bool{"watch_new_releases": req.Enabled})
 }
 
+func (s *Server) handleUpdateArtistLanguages(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	var req struct {
+		Languages []string `json:"languages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	cleaned := cleanLanguages(req.Languages)
+	if err := s.queries.UpdateArtistLanguages(id, cleaned); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update artist languages")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string][]string{"languages": cleaned})
+}
+
 func (s *Server) handleUnwatchArtist(w http.ResponseWriter, r *http.Request) {
 	id, err := parseID(r)
 	if err != nil {
@@ -738,9 +815,16 @@ func (s *Server) handleQueueArtistTracks(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to list wanted tracks")
 		return
 	}
-	ids := make([]int64, len(tracks))
-	for i, t := range tracks {
-		ids[i] = t.ID
+	artist, _ := s.queries.GetArtist(id)
+	var ids []int64
+	for _, t := range tracks {
+		if artist != nil && !language.IsAllLanguages(artist.Languages) {
+			trackLang := language.DetectTrackLanguage(t.AlbumTitle, t.Title)
+			if trackLang != language.Unknown && !language.MatchesArtistLanguages(artist.Languages, trackLang) {
+				continue
+			}
+		}
+		ids = append(ids, t.ID)
 	}
 	queued, err := s.queries.EnqueueDownloadBatch(ids)
 	if err != nil {
@@ -897,9 +981,15 @@ func (s *Server) handleQueueDownloads(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list wanted tracks")
 		return
 	}
-	ids := make([]int64, len(tracks))
-	for i, t := range tracks {
-		ids[i] = t.ID
+	var ids []int64
+	for _, t := range tracks {
+		if !language.IsAllLanguages(t.ArtistLanguages) {
+			trackLang := language.DetectTrackLanguage(t.AlbumTitle, t.Title)
+			if trackLang != language.Unknown && !language.MatchesArtistLanguages(t.ArtistLanguages, trackLang) {
+				continue
+			}
+		}
+		ids = append(ids, t.ID)
 	}
 	queued, err := s.queries.EnqueueDownloadBatch(ids)
 	if err != nil {

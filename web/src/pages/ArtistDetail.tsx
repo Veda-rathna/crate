@@ -7,6 +7,7 @@ import { formatTotalDuration } from '../lib/format';
 import FilterBar from '../components/FilterBar';
 import ProviderBadge from '../components/ProviderBadge';
 import ProgressBar from '../components/ProgressBar';
+import LanguageSelector from '../components/LanguageSelector';
 import type { Track, Album, ProviderInfo } from '../types/index';
 
 export default function ArtistDetail() {
@@ -62,6 +63,29 @@ export default function ArtistDetail() {
     },
     onError: (_err, _enabled, context) => {
       if (context?.prev) queryClient.setQueryData(['artist', id], context.prev);
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+    },
+  });
+
+  const updateLanguages = useMutation({
+    mutationFn: (languages: string[]) => api.updateArtistLanguages(Number(id), languages),
+    onMutate: async (languages) => {
+      await queryClient.cancelQueries({ queryKey: ['artist', id] });
+      const prev = queryClient.getQueryData(['artist', id]);
+      queryClient.setQueryData(['artist', id], (old: Record<string, unknown> | undefined) =>
+        old ? { ...old, languages } : old
+      );
+      return { prev };
+    },
+    onSuccess: () => {
+      toast('Language preferences updated', 'success');
+    },
+    onError: (err: Error, _languages, context) => {
+      if (context?.prev) queryClient.setQueryData(['artist', id], context.prev);
+      toast(err.message, 'error');
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['artist', id] });
@@ -349,6 +373,14 @@ export default function ArtistDetail() {
           {queueAll.isSuccess ? 'Queued!' : queueAll.isPending ? 'Queuing...' : `Search ${stats.wantedTracks} wanted tracks`}
         </button>
       )}
+
+      <div className="mb-3">
+        <LanguageSelector
+          selected={artist.languages || []}
+          onChange={(newLanguages) => updateLanguages.mutate(newLanguages)}
+          disabled={updateLanguages.isPending}
+        />
+      </div>
 
       <label className="flex items-center justify-between bg-zinc-800/50 rounded-lg px-3 py-2.5 mb-3 cursor-pointer">
         <div>

@@ -119,6 +119,22 @@ The `quality_fallback_enabled` setting (default true) controls whether files out
 
 **Negative keywords**: user-configurable list stored as JSON array in the `negative_keywords` setting (e.g. `["acapella", "instrumental"]`). Auto-downloads skip files whose filename matches any keyword. Manual search still returns them but marks `negative_match: true` so the UI can dim them. Case-insensitive matching against the lowercased filename.
 
+## Per-Artist Language Filtering
+
+Artists can be restricted to download music only in specific languages (e.g., Tamil only, Tamil and Telugu, Malayalam, Hindi, Kannada, English, or All Languages):
+
+- **Database**: `languages` column on `artists` table (migration `011_artist_languages.sql`), stored as a JSON array of normalized lowercase strings (`[]` or `["all"]` represents All Languages).
+- **API**: `PUT /api/artists/{id}/languages` with `{"languages": ["tamil", "telugu"]}` to update preferences for existing artists; `languages` array accepted when watching via `POST /api/watch/artist/{id}` or `POST /api/watch/album/{id}`.
+- **Language Detection** (`internal/language`):
+  1. Provider metadata: extracts MusicBrainz release `text-representation` (`language`, `script`) e.g. `tam`, `tel`, `mal`, `hin`, `kan`, `eng`.
+  2. Unicode scripts: detects Indic alphabets unambiguously via `\p{Tamil}`, `\p{Telugu}`, `\p{Malayalam}`, `\p{Kannada}`, and `\p{Devanagari}`.
+  3. Structured tags: detects bracketed or path-based qualifiers (e.g. `[Tamil]`, `(Telugu Version)`, `/Tamil Songs/`). Does not treat bare English words in song titles as definitive proof.
+- **Automatic download filtering**:
+  - Auto-download candidates (scheduler new releases, queue wanted tracks, and downloader candidate scoring) are checked against the artist's language preference.
+  - Safe behavior for Unknown language: if an artist has a specific language filter enabled, candidate tracks/releases/files with unknown language are skipped. `All Languages` allows everything as before.
+- **Manual search**:
+  - Manual search returns all slskd results without restriction. Mismatched results are annotated with `language_mismatch: true` and `detected_language`, displaying an amber badge in the UI while remaining fully downloadable if selected manually.
+
 ## Quality Upgrades
 
 - Priority-ordered quality tiers stored as JSON in settings (`quality_tiers`), default: FLAC > MP3 320 > MP3 256

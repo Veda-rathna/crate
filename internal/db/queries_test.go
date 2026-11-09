@@ -180,3 +180,68 @@ func TestReenqueueDoesNotDuplicateActivePending(t *testing.T) {
 		t.Errorf("expected original source 'user' preserved, got %q", downloads[0].Source)
 	}
 }
+
+func TestArtistLanguages(t *testing.T) {
+	q := newTestQueries(t)
+
+	// Create artist with languages
+	artist := &models.Artist{
+		Name:       "AR Rahman",
+		Provider:   "test",
+		ProviderID: "arr1",
+		Status:     models.ArtistStatusWatched,
+		Languages:  []string{"tamil", "hindi"},
+	}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch artist and verify languages
+	fetched, err := q.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fetched.Languages) != 2 || fetched.Languages[0] != "tamil" || fetched.Languages[1] != "hindi" {
+		t.Errorf("expected ['tamil', 'hindi'], got %v", fetched.Languages)
+	}
+
+	// Update languages
+	if err := q.UpdateArtistLanguages(artist.ID, []string{"tamil", "telugu"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchedAfter, err := q.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fetchedAfter.Languages) != 2 || fetchedAfter.Languages[0] != "tamil" || fetchedAfter.Languages[1] != "telugu" {
+		t.Errorf("expected ['tamil', 'telugu'], got %v", fetchedAfter.Languages)
+	}
+
+	// Add album and track, test GetTrackWithMeta gets ArtistLanguages
+	album := &models.Album{ArtistID: artist.ID, Title: "Roja", Provider: "test", ProviderID: "arr_al1", RecordType: "album", Status: models.AlbumStatusWatched}
+	if err := q.CreateAlbum(album); err != nil {
+		t.Fatal(err)
+	}
+	track := &models.Track{AlbumID: album.ID, Title: "Chinna Chinna Aasai", TrackNumber: 1, DiscNumber: 1, DurationMs: 200000, Provider: "test", ProviderID: "arr_t1", Status: models.TrackStatusWanted}
+	if err := q.CreateTrack(track); err != nil {
+		t.Fatal(err)
+	}
+
+	trackWithMeta, err := q.GetTrackWithMeta(track.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trackWithMeta.ArtistLanguages) != 2 || trackWithMeta.ArtistLanguages[0] != "tamil" || trackWithMeta.ArtistLanguages[1] != "telugu" {
+		t.Errorf("expected track ArtistLanguages to be ['tamil', 'telugu'], got %v", trackWithMeta.ArtistLanguages)
+	}
+
+	// Test ListWantedTracks gets ArtistLanguages
+	wanted, err := q.ListWantedTracks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wanted) != 1 || len(wanted[0].ArtistLanguages) != 2 {
+		t.Errorf("expected wanted track with ArtistLanguages, got %v", wanted)
+	}
+}

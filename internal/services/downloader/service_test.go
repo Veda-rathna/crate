@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -835,5 +836,100 @@ func TestScoreCandidatesIncludeAllKeepsUnsupportedFormat(t *testing.T) {
 	scored := scoreCandidates(results, track, nil, cfg)
 	if len(scored) != 1 {
 		t.Fatalf("includeAll should keep unsupported-format files, got %d", len(scored))
+	}
+}
+
+func TestScoreCandidatesLanguageFiltering(t *testing.T) {
+	results := []slskd.SearchResult{
+		{
+			Username: "user1",
+			Files: []slskd.SearchFile{
+				{Filename: "music/Anirudh - Badass [Tamil].flac", Size: 30000000},
+				{Filename: "music/Anirudh - Badass [Telugu].flac", Size: 30000000},
+				{Filename: "music/Anirudh - Badass [Hindi].flac", Size: 30000000},
+				{Filename: "music/Anirudh - Badass.flac", Size: 30000000},
+			},
+		},
+	}
+	cfg := scoringConfig{fallbackEnabled: true, requireArtist: true}
+
+	// 1. All Languages (default / empty): accepts all
+	trackAll := &models.Track{Title: "Badass", ArtistName: "Anirudh", ArtistLanguages: []string{}}
+	scoredAll := scoreCandidates(results, trackAll, nil, cfg)
+	if len(scoredAll) != 4 {
+		t.Fatalf("AllLanguages should keep all 4 candidates, got %d", len(scoredAll))
+	}
+
+	// 2. Tamil-only artist: accepts only Tamil, rejects Telugu, Hindi, and unknown
+	trackTamil := &models.Track{Title: "Badass", ArtistName: "Anirudh", ArtistLanguages: []string{"tamil"}}
+	scoredTamil := scoreCandidates(results, trackTamil, nil, cfg)
+	if len(scoredTamil) != 1 {
+		t.Fatalf("Tamil-only should keep 1 candidate, got %d", len(scoredTamil))
+	}
+	if !strings.Contains(scoredTamil[0].file.Filename, "[Tamil]") {
+		t.Errorf("Tamil-only candidate should be Tamil, got %s", scoredTamil[0].file.Filename)
+	}
+
+	// 3. Multi-language artist (Tamil and Telugu): accepts both, rejects Hindi and unknown
+	trackMulti := &models.Track{Title: "Badass", ArtistName: "Anirudh", ArtistLanguages: []string{"tamil", "telugu"}}
+	scoredMulti := scoreCandidates(results, trackMulti, nil, cfg)
+	if len(scoredMulti) != 2 {
+		t.Fatalf("Tamil and Telugu should keep 2 candidates, got %d", len(scoredMulti))
+	}
+
+	// 4. Unknown-language candidate is NOT automatically downloaded when specific language filter is set
+	resultsUnknownOnly := []slskd.SearchResult{
+		{
+			Username: "user1",
+			Files: []slskd.SearchFile{
+				{Filename: "music/Anirudh - Badass.flac", Size: 30000000},
+			},
+		},
+	}
+	scoredUnknown := scoreCandidates(resultsUnknownOnly, trackTamil, nil, cfg)
+	if len(scoredUnknown) != 0 {
+		t.Errorf("Unknown candidate should not be auto-downloaded for Tamil-only artist, got %d", len(scoredUnknown))
+	}
+}
+
+func TestFormatCandidatesLanguageAnnotation(t *testing.T) {
+	candidates := []candidate{
+		{
+			username: "user1",
+			file:     slskd.SearchFile{Filename: "music/Anirudh - Badass [Tamil].flac", Size: 30000000, BitRate: 0},
+			score:    100,
+		},
+		{
+			username: "user2",
+			file:     slskd.SearchFile{Filename: "music/Anirudh - Badass [Telugu].flac", Size: 30000000, BitRate: 0},
+			score:    95,
+		},
+	}
+	track := &models.Track{
+		Title:           "Badass",
+		ArtistName:      "Anirudh",
+		ArtistLanguages: []string{"tamil"},
+	}
+
+	// Test formatCandidates with database queries nil (no blacklist check)
+	formatted := formatCandidates(candidates, nil, nil, track)
+	if len(formatted) != 2 {
+		t.Fatalf("expected 2 manual search results, got %d", len(formatted))
+	}
+
+	// Tamil candidate should match
+	if formatted[0].LanguageMismatch {
+		t.Errorf("Tamil result should not have LanguageMismatch = true")
+	}
+	if formatted[0].DetectedLanguage != "tamil" {
+		t.Errorf("expected detected language 'tamil', got %q", formatted[0].DetectedLanguage)
+	}
+
+	// Telugu candidate should be marked as mismatch
+	if !formatted[1].LanguageMismatch {
+		t.Errorf("Telugu result for Tamil-only artist should have LanguageMismatch = true")
+	}
+	if formatted[1].DetectedLanguage != "telugu" {
+		t.Errorf("expected detected language 'telugu', got %q", formatted[1].DetectedLanguage)
 	}
 }

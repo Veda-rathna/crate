@@ -146,7 +146,7 @@ func TestOrganizeUpgradeRemovesReplacedFile(t *testing.T) {
 func TestOrganizeSamePathOverwrites(t *testing.T) {
 	env := newOrgEnv(t, intPtr(1997))
 
-	rel := filepath.Join("Radiohead", "OK Computer (1997)", "06 - Karma Police.flac")
+	rel := "Radiohead/OK Computer (1997)/06 - Karma Police.flac"
 	abs := filepath.Join(env.library, rel)
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 		t.Fatal(err)

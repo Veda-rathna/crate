@@ -239,10 +239,15 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 	year := parseYear(rgResp.FirstReleaseDate)
 
 	var tracks []*pb.TrackInfo
+	albumMetadata := map[string]string{}
 	if len(rgResp.Releases) > 0 {
 		releaseID := rgResp.Releases[0].ID
 
 		var relResp struct {
+			TextRepresentation struct {
+				Language string `json:"language"`
+				Script   string `json:"script"`
+			} `json:"text-representation"`
 			Media []struct {
 				Position int `json:"position"`
 				Tracks   []struct {
@@ -256,6 +261,12 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		}
 
 		if err := s.get(ctx, "/release/"+releaseID+"?inc=recordings&fmt=json", &relResp); err == nil {
+			if relResp.TextRepresentation.Language != "" {
+				albumMetadata["language"] = relResp.TextRepresentation.Language
+			}
+			if relResp.TextRepresentation.Script != "" {
+				albumMetadata["script"] = relResp.TextRepresentation.Script
+			}
 			for _, media := range relResp.Media {
 				for _, t := range media.Tracks {
 					trackNum, _ := strconv.Atoi(t.Number)
@@ -282,6 +293,7 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		CoverUrl:   "https://coverartarchive.org/release-group/" + rgResp.ID + "/front-250",
 		ArtistName: artistName,
 		Tracks:     tracks,
+		Metadata:   albumMetadata,
 	}, nil
 }
 

@@ -79,6 +79,7 @@ Open `http://localhost:6969`.
 - **Manual search** -- browse every slskd result for a track, see scores/format/queue info (blacklisted and locked sources shown but dimmed), and pick which one to download
 - **Quality tiers** -- configure priority-ordered quality tiers (e.g. FLAC > MP3 320 > MP3 256) with an optional fallback toggle to reject files outside your configured tiers. Scheduler scans one artist per day and re-queues tracks that can be upgraded.
 - **Negative keywords** -- skip files matching configurable keywords (e.g. acapella, instrumental) during auto-download. Manual search still shows them so you can override when needed.
+- **Per-artist language filtering** -- configure language preferences per artist (e.g. Tamil only, Tamil & Telugu, All Languages). Auto-downloading skips releases and tracks in non-matching languages, while manual search flags mismatches without restricting selection.
 - **Import existing library** -- tag-based scan of your on-disk collection with dry-run preview; MusicBrainz-tagged files (Picard/beets) link to their real provider IDs automatically
 - **Navidrome integration** -- optionally trigger a Navidrome library scan after each download so new files appear immediately
 - **Music Assistant integration** -- optionally sync your [Music Assistant](https://www.music-assistant.io/) library after each download, and **mark a track bad right from the MA app** by dropping it into a reject playlist: Crate deletes the bad copy, blacklists the source, and re-downloads a better one

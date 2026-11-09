@@ -45,6 +45,7 @@ type Artist struct {
 	Status                ArtistStatus `json:"status" db:"status"`
 	WatchNewReleases      bool         `json:"watch_new_releases" db:"watch_new_releases"`
 	WatchNewReleasesSince *string      `json:"watch_new_releases_since,omitempty" db:"watch_new_releases_since"`
+	Languages             []string     `json:"languages" db:"languages"`
 	CreatedAt             string       `json:"created_at" db:"created_at"`
 	UpdatedAt             string       `json:"updated_at" db:"updated_at"`
 	Albums                []Album      `json:"albums,omitempty"`
@@ -89,6 +90,7 @@ type Track struct {
 	UpdatedAt       string      `json:"updated_at" db:"updated_at"`
 	AlbumTitle      string      `json:"album_title,omitempty"`
 	ArtistName      string      `json:"artist_name,omitempty"`
+	ArtistLanguages []string    `json:"artist_languages,omitempty"`
 }
 
 type QualityTier struct {

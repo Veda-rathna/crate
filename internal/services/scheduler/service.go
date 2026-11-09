@@ -10,6 +10,7 @@ import (
 
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/library"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
@@ -90,6 +91,31 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 					continue
 				}
 			}
+
+			// Check artist language preference on candidate release
+			if !language.IsAllLanguages(artist.Languages) {
+				summaryLang := language.DetectReleaseSummaryLanguage(pa.Title, pa.Metadata)
+				if summaryLang != language.Unknown && !language.MatchesArtistLanguages(artist.Languages, summaryLang) {
+					slog.Info("scheduler: skipping release due to language preference",
+						"artist", artist.Name, "album", pa.Title, "language", summaryLang, "preferences", artist.Languages)
+					continue
+				}
+			}
+
+			albumDetail, err := s.providers.GetAlbum(ctx, artist.Provider, pa.Id)
+			if err != nil {
+				continue
+			}
+
+			if !language.IsAllLanguages(artist.Languages) {
+				detailLang := language.DetectAlbumDetailLanguage(albumDetail)
+				if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+					slog.Info("scheduler: skipping release due to language preference",
+						"artist", artist.Name, "album", pa.Title, "language", detailLang, "preferences", artist.Languages)
+					continue
+				}
+			}
+
 			year := int(pa.Year)
 			var yearPtr *int
 			if year > 0 {
@@ -107,10 +133,6 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 				Status:     models.AlbumStatusWatched,
 			}
 			if err := s.queries.CreateAlbum(&album); err != nil {
-				continue
-			}
-			albumDetail, err := s.providers.GetAlbum(ctx, artist.Provider, pa.Id)
-			if err != nil {
 				continue
 			}
 			for _, pt := range albumDetail.Tracks {
@@ -162,6 +184,12 @@ func (s *Service) queueWantedTracks() {
 	}
 	queued := 0
 	for _, t := range tracks {
+		if !language.IsAllLanguages(t.ArtistLanguages) {
+			trackLang := language.DetectTrackLanguage(t.AlbumTitle, t.Title)
+			if trackLang != language.Unknown && !language.MatchesArtistLanguages(t.ArtistLanguages, trackLang) {
+				continue
+			}
+		}
 		if s.queries.ReenqueueDownload(t.ID) == nil {
 			queued++
 		}

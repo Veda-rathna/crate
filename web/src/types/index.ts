@@ -7,6 +7,7 @@ export interface Artist {
   status: 'watched' | 'partial' | 'owned';
   watch_new_releases: boolean;
   watch_new_releases_since?: string;
+  languages?: string[];
   created_at: string;
   updated_at: string;
   albums?: Album[];
@@ -171,6 +172,8 @@ export interface ManualSearchResult {
   blacklisted: boolean;
   negative_match: boolean;
   locked: boolean;
+  language_mismatch?: boolean;
+  detected_language?: string;
 }
 
 export interface ManualSearchResponse {

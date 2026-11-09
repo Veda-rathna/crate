@@ -1059,6 +1059,40 @@ func TestToggleNewReleases(t *testing.T) {
 	}
 }
 
+func TestUpdateArtistLanguages(t *testing.T) {
+	env := newTestEnv(t)
+	env.do("POST", "/api/watch/artist/1000", `{"languages": ["tamil"]}`)
+
+	artists, _ := env.queries.ListArtists()
+	if len(artists) != 1 {
+		t.Fatalf("expected 1 artist, got %d", len(artists))
+	}
+	if len(artists[0].Languages) != 1 || artists[0].Languages[0] != "tamil" {
+		t.Errorf("expected ['tamil'], got %v", artists[0].Languages)
+	}
+
+	// Update languages
+	w := env.do("PUT", fmt.Sprintf("/api/artists/%d/languages", artists[0].ID), `{"languages": ["tamil", "telugu"]}`)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	artist, _ := env.queries.GetArtist(artists[0].ID)
+	if len(artist.Languages) != 2 || artist.Languages[0] != "tamil" || artist.Languages[1] != "telugu" {
+		t.Errorf("expected ['tamil', 'telugu'], got %v", artist.Languages)
+	}
+
+	// Get artist via API
+	w = env.do("GET", fmt.Sprintf("/api/artists/%d", artists[0].ID), "")
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	getResp := decode[models.Artist](t, w)
+	if len(getResp.Languages) != 2 {
+		t.Errorf("expected 2 languages in GET artist, got %v", getResp.Languages)
+	}
+}
+
 func TestSettingsCRUD(t *testing.T) {
 	env := newTestEnv(t)
 

@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
@@ -19,14 +20,34 @@ func now() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
+func parseLanguages(raw *string) []string {
+	if raw == nil || *raw == "" {
+		return []string{}
+	}
+	var langs []string
+	if err := json.Unmarshal([]byte(*raw), &langs); err != nil {
+		return []string{}
+	}
+	if langs == nil {
+		return []string{}
+	}
+	return langs
+}
+
 // Artists
 
 func (q *Queries) CreateArtist(a *models.Artist) error {
 	ts := now()
+	langsJSON := "[]"
+	if len(a.Languages) > 0 {
+		if b, err := json.Marshal(a.Languages); err == nil {
+			langsJSON = string(b)
+		}
+	}
 	result, err := q.db.Exec(
-		`INSERT INTO artists (name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.Name, a.Provider, a.ProviderID, a.ImageURL, a.Status, a.WatchNewReleases, a.WatchNewReleasesSince, ts, ts,
+		`INSERT INTO artists (name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.Name, a.Provider, a.ProviderID, a.ImageURL, a.Status, a.WatchNewReleases, a.WatchNewReleasesSince, langsJSON, ts, ts,
 	)
 	if err != nil {
 		return err
@@ -39,19 +60,21 @@ func (q *Queries) CreateArtist(a *models.Artist) error {
 
 func (q *Queries) GetArtist(id int64) (*models.Artist, error) {
 	a := &models.Artist{}
+	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
 		 FROM artists WHERE id = ?`, id,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	a.Languages = parseLanguages(langsRaw)
 	return a, nil
 }
 
 func (q *Queries) ListArtists() ([]models.Artist, error) {
 	rows, err := q.db.Query(
-		`SELECT a.id, a.name, a.provider, a.provider_id, a.image_url, a.status, a.watch_new_releases, a.watch_new_releases_since, a.created_at, a.updated_at,
+		`SELECT a.id, a.name, a.provider, a.provider_id, a.image_url, a.status, a.watch_new_releases, a.watch_new_releases_since, a.languages, a.created_at, a.updated_at,
 		        COUNT(t.id) as total_tracks,
 		        COALESCE(SUM(CASE WHEN t.status = 'owned' THEN 1 ELSE 0 END), 0) as owned_tracks
 		 FROM artists a
@@ -68,10 +91,12 @@ func (q *Queries) ListArtists() ([]models.Artist, error) {
 	var artists []models.Artist
 	for rows.Next() {
 		var a models.Artist
+		var langsRaw *string
 		if err := rows.Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status,
-			&a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt, &a.TotalTracks, &a.OwnedTracks); err != nil {
+			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt, &a.TotalTracks, &a.OwnedTracks); err != nil {
 			return nil, err
 		}
+		a.Languages = parseLanguages(langsRaw)
 		artists = append(artists, a)
 	}
 	return artists, rows.Err()
@@ -100,15 +125,26 @@ func (q *Queries) DeleteArtist(id int64) error {
 	return err
 }
 
+func (q *Queries) UpdateArtistLanguages(id int64, languages []string) error {
+	raw, err := json.Marshal(languages)
+	if err != nil {
+		return err
+	}
+	_, err = q.db.Exec(`UPDATE artists SET languages = ?, updated_at = ? WHERE id = ?`, string(raw), now(), id)
+	return err
+}
+
 func (q *Queries) FindArtistByProvider(provider, providerID string) (*models.Artist, error) {
 	a := &models.Artist{}
+	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
 		 FROM artists WHERE provider = ? AND provider_id = ?`, provider, providerID,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	a.Languages = parseLanguages(langsRaw)
 	return a, nil
 }
 
@@ -117,19 +153,21 @@ func (q *Queries) FindArtistByProvider(provider, providerID string) (*models.Art
 // "Radiohead" instead of creating a duplicate.
 func (q *Queries) FindArtistByNameFold(name string) (*models.Artist, error) {
 	a := &models.Artist{}
+	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
 		 FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1`, name,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	a.Languages = parseLanguages(langsRaw)
 	return a, nil
 }
 
 func (q *Queries) ListWatchedArtists() ([]models.Artist, error) {
 	rows, err := q.db.Query(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
 		 FROM artists WHERE watch_new_releases = 1 ORDER BY name`,
 	)
 	if err != nil {
@@ -140,10 +178,12 @@ func (q *Queries) ListWatchedArtists() ([]models.Artist, error) {
 	var artists []models.Artist
 	for rows.Next() {
 		var a models.Artist
+		var langsRaw *string
 		if err := rows.Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status,
-			&a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
+		a.Languages = parseLanguages(langsRaw)
 		artists = append(artists, a)
 	}
 	return artists, rows.Err()
@@ -469,11 +509,12 @@ func (q *Queries) RejectTrack(id int64) error {
 
 func (q *Queries) GetTrackWithMeta(id int64) (*models.Track, error) {
 	t := &models.Track{}
+	var langsRaw *string
 	err := q.db.QueryRow(
 		`SELECT t.id, t.album_id, t.title, t.track_number, t.disc_number, t.duration_ms,
 		        t.provider, t.provider_id, t.status, t.file_path, t.downloaded_from, t.downloaded_filename,
 		        t.download_format, t.download_bitrate, t.created_at, t.updated_at,
-		        al.title, ar.name
+		        al.title, ar.name, ar.languages
 		 FROM tracks t
 		 JOIN albums al ON al.id = t.album_id
 		 JOIN artists ar ON ar.id = al.artist_id
@@ -481,10 +522,11 @@ func (q *Queries) GetTrackWithMeta(id int64) (*models.Track, error) {
 	).Scan(&t.ID, &t.AlbumID, &t.Title, &t.TrackNumber, &t.DiscNumber, &t.DurationMs,
 		&t.Provider, &t.ProviderID, &t.Status, &t.FilePath, &t.DownloadedFrom, &t.DownloadedFilename,
 		&t.DownloadFormat, &t.DownloadBitrate, &t.CreatedAt, &t.UpdatedAt,
-		&t.AlbumTitle, &t.ArtistName)
+		&t.AlbumTitle, &t.ArtistName, &langsRaw)
 	if err != nil {
 		return nil, err
 	}
+	t.ArtistLanguages = parseLanguages(langsRaw)
 	return t, nil
 }
 
@@ -496,7 +538,7 @@ func (q *Queries) ListWantedTracksLimited(limit int) ([]models.Track, error) {
 	query := `SELECT t.id, t.album_id, t.title, t.track_number, t.disc_number, t.duration_ms,
 	                 t.provider, t.provider_id, t.status, t.file_path, t.downloaded_from, t.downloaded_filename,
 	                 t.download_format, t.download_bitrate, t.created_at, t.updated_at,
-	                 al.title, ar.name
+	                 al.title, ar.name, ar.languages
 	          FROM tracks t
 	          JOIN albums al ON al.id = t.album_id
 	          JOIN artists ar ON ar.id = al.artist_id
@@ -519,7 +561,7 @@ func (q *Queries) ListWantedTracksWithCooldown(cooldownCutoff string, limit int)
 	query := `SELECT t.id, t.album_id, t.title, t.track_number, t.disc_number, t.duration_ms,
 	                 t.provider, t.provider_id, t.status, t.file_path, t.downloaded_from, t.downloaded_filename,
 	                 t.download_format, t.download_bitrate, t.created_at, t.updated_at,
-	                 al.title, ar.name
+	                 al.title, ar.name, ar.languages
 	          FROM tracks t
 	          JOIN albums al ON al.id = t.album_id
 	          JOIN artists ar ON ar.id = al.artist_id
@@ -547,12 +589,14 @@ func scanTracks(rows *sql.Rows) ([]models.Track, error) {
 	var tracks []models.Track
 	for rows.Next() {
 		var t models.Track
+		var langsRaw *string
 		if err := rows.Scan(&t.ID, &t.AlbumID, &t.Title, &t.TrackNumber, &t.DiscNumber, &t.DurationMs,
 			&t.Provider, &t.ProviderID, &t.Status, &t.FilePath, &t.DownloadedFrom, &t.DownloadedFilename,
 			&t.DownloadFormat, &t.DownloadBitrate, &t.CreatedAt, &t.UpdatedAt,
-			&t.AlbumTitle, &t.ArtistName); err != nil {
+			&t.AlbumTitle, &t.ArtistName, &langsRaw); err != nil {
 			return nil, err
 		}
+		t.ArtistLanguages = parseLanguages(langsRaw)
 		tracks = append(tracks, t)
 	}
 	return tracks, rows.Err()
@@ -563,7 +607,7 @@ func (q *Queries) ListWantedTracksByArtist(artistID int64) ([]models.Track, erro
 		`SELECT t.id, t.album_id, t.title, t.track_number, t.disc_number, t.duration_ms,
 		        t.provider, t.provider_id, t.status, t.file_path, t.downloaded_from, t.downloaded_filename,
 		        t.download_format, t.download_bitrate, t.created_at, t.updated_at,
-		        al.title, ar.name
+		        al.title, ar.name, ar.languages
 		 FROM tracks t
 		 JOIN albums al ON al.id = t.album_id
 		 JOIN artists ar ON ar.id = al.artist_id
@@ -574,19 +618,7 @@ func (q *Queries) ListWantedTracksByArtist(artistID int64) ([]models.Track, erro
 		return nil, err
 	}
 	defer rows.Close()
-
-	var tracks []models.Track
-	for rows.Next() {
-		var t models.Track
-		if err := rows.Scan(&t.ID, &t.AlbumID, &t.Title, &t.TrackNumber, &t.DiscNumber, &t.DurationMs,
-			&t.Provider, &t.ProviderID, &t.Status, &t.FilePath, &t.DownloadedFrom, &t.DownloadedFilename,
-			&t.DownloadFormat, &t.DownloadBitrate, &t.CreatedAt, &t.UpdatedAt,
-			&t.AlbumTitle, &t.ArtistName); err != nil {
-			return nil, err
-		}
-		tracks = append(tracks, t)
-	}
-	return tracks, rows.Err()
+	return scanTracks(rows)
 }
 
 func (q *Queries) ListWantedTracksByAlbum(albumID int64) ([]models.Track, error) {
@@ -594,7 +626,7 @@ func (q *Queries) ListWantedTracksByAlbum(albumID int64) ([]models.Track, error)
 		`SELECT t.id, t.album_id, t.title, t.track_number, t.disc_number, t.duration_ms,
 		        t.provider, t.provider_id, t.status, t.file_path, t.downloaded_from, t.downloaded_filename,
 		        t.download_format, t.download_bitrate, t.created_at, t.updated_at,
-		        al.title, ar.name
+		        al.title, ar.name, ar.languages
 		 FROM tracks t
 		 JOIN albums al ON al.id = t.album_id
 		 JOIN artists ar ON ar.id = al.artist_id
@@ -605,19 +637,7 @@ func (q *Queries) ListWantedTracksByAlbum(albumID int64) ([]models.Track, error)
 		return nil, err
 	}
 	defer rows.Close()
-
-	var tracks []models.Track
-	for rows.Next() {
-		var t models.Track
-		if err := rows.Scan(&t.ID, &t.AlbumID, &t.Title, &t.TrackNumber, &t.DiscNumber, &t.DurationMs,
-			&t.Provider, &t.ProviderID, &t.Status, &t.FilePath, &t.DownloadedFrom, &t.DownloadedFilename,
-			&t.DownloadFormat, &t.DownloadBitrate, &t.CreatedAt, &t.UpdatedAt,
-			&t.AlbumTitle, &t.ArtistName); err != nil {
-			return nil, err
-		}
-		tracks = append(tracks, t)
-	}
-	return tracks, rows.Err()
+	return scanTracks(rows)
 }
 
 func (q *Queries) ListOwnedTracksWithPaths() ([]models.Track, error) {
@@ -684,13 +704,15 @@ func (q *Queries) ListOwnedTracksByArtist(artistID int64) ([]models.Track, error
 
 func (q *Queries) NextArtistForUpgrade(lastID int64) (*models.Artist, error) {
 	a := &models.Artist{}
+	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
 		 FROM artists WHERE id > ? ORDER BY id LIMIT 1`, lastID,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	a.Languages = parseLanguages(langsRaw)
 	return a, nil
 }
 

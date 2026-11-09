@@ -902,6 +902,10 @@
         <strong>Negative keywords:</strong> Configure keywords like <code>acapella</code> or <code>instrumental</code> in Settings. Files matching any keyword are automatically skipped during scheduled downloads. Manual search still returns them (dimmed, labeled "negative keyword") so you can override when needed.
       </div>
 
+      <div class="callout">
+        <strong>Language filtering:</strong> Configure preferred languages per artist (Tamil, Telugu, Malayalam, Hindi, Kannada, English, etc.). Candidate releases and tracks in non-matching languages are skipped during automatic downloads. Manual search marks mismatched candidates with a badge without blocking manual download.
+      </div>
+
       <!-- Quality Upgrades -->
       <h2 id="quality-upgrades">Quality Upgrades</h2>
 
@@ -1177,6 +1181,7 @@
             <tr><td><code>GET</code></td><td><code>/api/library/search?q=</code></td><td>Search your local library.</td></tr>
             <tr><td><code>GET</code></td><td><code>/api/artists</code></td><td>List all watched/owned artists.</td></tr>
             <tr><td><code>GET</code></td><td><code>/api/artists/{id}</code></td><td>Get artist details with albums.</td></tr>
+            <tr><td><code>PUT</code></td><td><code>/api/artists/{id}/languages</code></td><td>Update preferred languages for artist.</td></tr>
             <tr><td><code>DELETE</code></td><td><code>/api/artists/{id}</code></td><td>Remove artist and all associated data.</td></tr>
             <tr><td><code>GET</code></td><td><code>/api/albums/{id}</code></td><td>Get album details with tracks.</td></tr>
             <tr><td><code>DELETE</code></td><td><code>/api/albums/{id}</code></td><td>Remove album.</td></tr>

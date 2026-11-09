@@ -24,12 +24,12 @@ export const api = {
   browseAlbum: (id: string, provider?: string) =>
     request<BrowseAlbumDetail>(`/browse/album/${id}${provider ? `?provider=${encodeURIComponent(provider)}` : ''}`),
 
-  watchArtist: (id: string, opts?: { watch_new_releases?: boolean; provider?: string }) =>
+  watchArtist: (id: string, opts?: { watch_new_releases?: boolean; languages?: string[]; provider?: string }) =>
     request<Artist>(`/watch/artist/${id}`, {
       method: 'POST',
       body: JSON.stringify(opts ?? {}),
     }),
-  watchAlbum: (id: string, artistInfo: { artist_provider_id: string; artist_name: string; artist_image_url: string; provider?: string }) =>
+  watchAlbum: (id: string, artistInfo: { artist_provider_id: string; artist_name: string; artist_image_url: string; languages?: string[]; provider?: string }) =>
     request<Album>(`/watch/album/${id}`, {
       method: 'POST',
       body: JSON.stringify(artistInfo),
@@ -69,6 +69,11 @@ export const api = {
     request<{ watch_new_releases: boolean }>(`/artists/${id}/new-releases`, {
       method: 'PUT',
       body: JSON.stringify({ enabled }),
+    }),
+  updateArtistLanguages: (id: number, languages: string[]) =>
+    request<{ languages: string[] }>(`/artists/${id}/languages`, {
+      method: 'PUT',
+      body: JSON.stringify({ languages }),
     }),
 
   unwatchArtist: (id: number) =>

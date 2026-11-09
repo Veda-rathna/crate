@@ -604,12 +604,21 @@ export default function AlbumDetail() {
                                   ? 'opacity-40 cursor-not-allowed bg-zinc-800/30'
                                   : r.negative_match
                                   ? 'opacity-60 bg-zinc-800/30 active:bg-zinc-700'
+                                  : r.language_mismatch
+                                  ? 'bg-amber-950/25 border border-amber-800/50 active:bg-amber-900/30'
                                   : 'bg-zinc-800/50 active:bg-zinc-700'
                               }`}
                             >
                               <div className="flex items-center gap-2">
                                 <div className="flex-1 min-w-0">
-                                  <p className="text-[11px] truncate">{r.filename.split(/[/\\]/).pop()}</p>
+                                  <div className="flex items-center gap-1.5">
+                                    <p className="text-[11px] truncate">{r.filename.split(/[/\\]/).pop()}</p>
+                                    {r.language_mismatch && (
+                                      <span className="shrink-0 text-[9px] font-medium bg-amber-900/60 text-amber-300 border border-amber-700/50 px-1 py-0.5 rounded">
+                                        Language Mismatch{r.detected_language ? `: ${r.detected_language}` : ''}
+                                      </span>
+                                    )}
+                                  </div>
                                   <p className="text-[10px] text-zinc-500 truncate">
                                     {r.username}
                                     {' · '}{r.format}
@@ -619,6 +628,7 @@ export default function AlbumDetail() {
                                     {r.blacklisted && ' · blacklisted'}
                                     {r.locked && ' · locked'}
                                     {r.negative_match && ' · negative keyword'}
+                                    {r.language_mismatch && ' · language mismatch'}
                                   </p>
                                 </div>
                                 <span className={`text-[10px] font-medium tabular-nums shrink-0 ${

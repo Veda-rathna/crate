@@ -117,7 +117,7 @@ func (s *Service) Organize(track *models.Track) error {
 	if err != nil {
 		return fmt.Errorf("organizer: relative path: %w", err)
 	}
-	return s.queries.UpdateTrackFilePath(track.ID, relPath)
+	return s.queries.UpdateTrackFilePath(track.ID, filepath.ToSlash(relPath))
 }
 
 // storedFilePath returns the track's current file path from the DB resolved

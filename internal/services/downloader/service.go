@@ -13,6 +13,7 @@ import (
 
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
 )
@@ -517,8 +518,10 @@ type ManualSearchResult struct {
 	FreeSlot      bool   `json:"free_slot"`
 	QueueLength   int    `json:"queue_length"`
 	Blacklisted   bool   `json:"blacklisted"`
-	NegativeMatch bool   `json:"negative_match"`
-	Locked        bool   `json:"locked"`
+	NegativeMatch    bool   `json:"negative_match"`
+	Locked           bool   `json:"locked"`
+	LanguageMismatch bool   `json:"language_mismatch"`
+	DetectedLanguage string `json:"detected_language,omitempty"`
 }
 
 // ManualSearch runs a slskd search for a track and returns all scored results.
@@ -565,7 +568,7 @@ func (s *Service) PollManualSearch(ctx context.Context, trackID int64, searchID 
 	candidates := scoreCandidates(search.Responses, track, nil, cfg)
 
 	return &ManualSearchResponse{
-		Results:    formatCandidates(candidates, s.queries, cfg.negativeKeywords),
+		Results:    formatCandidates(candidates, s.queries, cfg.negativeKeywords, track),
 		IsComplete: search.IsComplete,
 		FileCount:  search.FileCount,
 	}, nil
@@ -576,7 +579,7 @@ func (s *Service) CleanupSearch(ctx context.Context, searchID string) {
 	_ = s.slskd.DeleteSearch(ctx, searchID)
 }
 
-func formatCandidates(candidates []candidate, q *db.Queries, negativeKeywords []string) []ManualSearchResult {
+func formatCandidates(candidates []candidate, q *db.Queries, negativeKeywords []string, track *models.Track) []ManualSearchResult {
 	results := make([]ManualSearchResult, 0, len(candidates))
 	for _, c := range candidates {
 		ext := strings.ToLower(filepath.Ext(c.file.Filename))
@@ -590,21 +593,42 @@ func formatCandidates(candidates []candidate, q *db.Queries, negativeKeywords []
 			format = strings.ToUpper(format)
 		}
 
+		albumTitle := ""
+		trackTitle := ""
+		if track != nil {
+			albumTitle = track.AlbumTitle
+			trackTitle = track.Title
+		}
+		candLang := language.DetectCandidateFileLanguage(c.file.Filename, albumTitle, trackTitle)
+		langMismatch := false
+		if track != nil && !language.IsAllLanguages(track.ArtistLanguages) {
+			if candLang != language.Unknown && !language.MatchesArtistLanguages(track.ArtistLanguages, candLang) {
+				langMismatch = true
+			}
+		}
+
+		var detectedLang string
+		if candLang != language.Unknown {
+			detectedLang = candLang
+		}
+
 		results = append(results, ManualSearchResult{
-			Username:      c.username,
-			Filename:      c.file.Filename,
-			Size:          c.file.Size,
-			BitRate:       c.file.BitRate,
-			SampleRate:    c.file.SampleRate,
-			BitDepth:      c.file.BitDepth,
-			Duration:      c.file.Length,
-			Format:        format,
-			Score:         c.score,
-			FreeSlot:      c.freeSlot,
-			QueueLength:   c.queueLength,
-			Blacklisted:   q.IsBlacklisted(c.username, c.file.Filename),
-			NegativeMatch: matchesNegativeKeyword(strings.ToLower(c.file.Filename), negativeKeywords),
-			Locked:        c.file.IsLocked,
+			Username:         c.username,
+			Filename:         c.file.Filename,
+			Size:             c.file.Size,
+			BitRate:          c.file.BitRate,
+			SampleRate:       c.file.SampleRate,
+			BitDepth:         c.file.BitDepth,
+			Duration:         c.file.Length,
+			Format:           format,
+			Score:            c.score,
+			FreeSlot:         c.freeSlot,
+			QueueLength:      c.queueLength,
+			Blacklisted:      q != nil && q.IsBlacklisted(c.username, c.file.Filename),
+			NegativeMatch:    matchesNegativeKeyword(strings.ToLower(c.file.Filename), negativeKeywords),
+			Locked:           c.file.IsLocked,
+			LanguageMismatch: langMismatch,
+			DetectedLanguage: detectedLang,
 		})
 	}
 	return results
@@ -675,6 +699,12 @@ func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac avail
 				}
 				if cfg.excludeNegative && matchesNegativeKeyword(nameLower, cfg.negativeKeywords) {
 					continue
+				}
+				if track != nil && !language.IsAllLanguages(track.ArtistLanguages) {
+					candLang := language.DetectCandidateFileLanguage(f.Filename, track.AlbumTitle, track.Title)
+					if !language.MatchesArtistLanguages(track.ArtistLanguages, candLang) {
+						continue
+					}
 				}
 			}
 

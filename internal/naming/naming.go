@@ -72,7 +72,7 @@ func Render(template string, m Meta) (string, error) {
 		}
 		out[i] = s
 	}
-	return filepath.Join(out...), nil
+	return filepath.ToSlash(filepath.Join(out...)), nil
 }
 
 func parse(template string) ([][]part, error) {
