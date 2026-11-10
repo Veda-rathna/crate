@@ -55,6 +55,14 @@ func (pm *ProcessManager) StartProviders(ctx context.Context, manager *Manager, 
 		port := cfg.Address
 		cmd := exec.Command(cfg.Binary)
 		cmd.Env = append(os.Environ(), "PORT="+port)
+		if manager != nil && manager.queries != nil {
+			if id, err := manager.queries.GetSetting("spotify_client_id"); err == nil && id != "" {
+				cmd.Env = append(cmd.Env, "SPOTIFY_CLIENT_ID="+id)
+			}
+			if secret, err := manager.queries.GetSetting("spotify_client_secret"); err == nil && secret != "" {
+				cmd.Env = append(cmd.Env, "SPOTIFY_CLIENT_SECRET="+secret)
+			}
+		}
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 

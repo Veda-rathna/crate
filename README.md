@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  Self-hosted music manager. Search for artists via pluggable providers (MusicBrainz, Deezer, or custom gRPC), watch their discographies, and automatically download via <a href="https://github.com/slskd/slskd">slskd</a> (Soulseek). Optional <a href="https://www.navidrome.org/">Navidrome</a> and <a href="https://www.music-assistant.io/">Music Assistant</a> integrations trigger a library scan/sync so new music appears immediately — and with Music Assistant you can mark a track bad right from the app. Mobile-first UI.<br /><br />Docs: <a href="https://runcrate.dev/">runcrate.dev</a><br /><br />
+  Self-hosted music manager. Search for artists via pluggable providers (MusicBrainz, Deezer, Spotify, or custom gRPC), watch their discographies, and automatically download via <a href="https://arcod.xyz/">Arcod</a> (lossless FLAC) and <a href="https://github.com/slskd/slskd">slskd</a> (Soulseek). Optional <a href="https://www.navidrome.org/">Navidrome</a> and <a href="https://www.music-assistant.io/">Music Assistant</a> integrations trigger a library scan/sync so new music appears immediately — and with Music Assistant you can mark a track bad right from the app. Mobile-first UI.<br /><br />Docs: <a href="https://runcrate.dev/">runcrate.dev</a><br /><br />
 </p>
 
 <p align="center">
@@ -67,10 +67,10 @@ Open `http://localhost:6969`.
 
 ## Features
 
-- **Pluggable providers** -- search via MusicBrainz, Deezer, or custom gRPC providers. Switch providers on the fly from the search UI.
+- **Pluggable providers** -- search via MusicBrainz, Deezer, Spotify, or custom gRPC providers. Switch providers on the fly from the search UI.
 - **Search** -- find artists, browse their full discography with metadata
 - **Watch** -- save artists, albums, or individual tracks to your library
-- **Download** -- searches slskd (Soulseek), scores all results using a unified scoring system, and downloads the best match automatically
+- **Download** -- searches Arcod for direct lossless FLAC streaming/downloads first, with seamless fallback to slskd (Soulseek) scored using a unified scoring system
 - **Smart scoring** -- tier-based quality scoring from your configured priority list, artist name matching bonus, free upload slot bonus, and queue-length-aware scoring using inverse decay. Quality always dominates; availability tips close calls.
 - **Retry with backoff** -- failed downloads retry with backoff (5m → 15m → 30m → 1h, gives up after ~2h). Failed sources are blacklisted per-user per-file so they're never retried.
 - **Shadow banning** -- users who go offline mid-transfer or whose queued downloads stall are temporarily blocked (configurable duration, default 60min). Different from permanent file blacklists -- shadow bans expire automatically.

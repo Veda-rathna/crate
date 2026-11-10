@@ -1,12 +1,15 @@
 package downloader
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
 )
 
@@ -931,5 +934,57 @@ func TestFormatCandidatesLanguageAnnotation(t *testing.T) {
 	}
 	if formatted[1].DetectedLanguage != "telugu" {
 		t.Errorf("expected detected language 'telugu', got %q", formatted[1].DetectedLanguage)
+	}
+}
+
+type fakeArcodProvider struct {
+	items       []arcod.TrackItem
+	bestTrack   *arcod.TrackItem
+	downloaded  map[int64]string
+	downloadErr error
+	enabled     bool
+}
+
+func (f *fakeArcodProvider) Search(ctx context.Context, query string) ([]arcod.TrackItem, error) {
+	return f.items, nil
+}
+
+func (f *fakeArcodProvider) FindBestTrack(ctx context.Context, artistName, trackTitle string) (*arcod.TrackItem, error) {
+	if f.downloadErr != nil {
+		return nil, f.downloadErr
+	}
+	return f.bestTrack, nil
+}
+
+func (f *fakeArcodProvider) DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error) {
+	if f.downloadErr != nil {
+		return 0, f.downloadErr
+	}
+	if f.downloaded == nil {
+		f.downloaded = make(map[int64]string)
+	}
+	f.downloaded[trackID] = destPath
+	_ = os.WriteFile(destPath, []byte("fLaCdummy"), 0644)
+	return 1000, nil
+}
+
+func (f *fakeArcodProvider) IsEnabled() bool {
+	return f.enabled
+}
+
+func TestSanitizeFilename(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"Pink Floyd - Time", "Pink Floyd - Time"},
+		{"AC/DC - Back in Black", "AC_DC - Back in Black"},
+		{"Artist: Name? * <Test>", "Artist_ Name_ _ _Test_"},
+	}
+	for _, tt := range tests {
+		got := sanitizeFilename(tt.in)
+		if got != tt.want {
+			t.Errorf("sanitizeFilename(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

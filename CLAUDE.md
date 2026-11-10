@@ -68,7 +68,9 @@ For external providers: `CRATE_PROVIDERS=spotify:external:192.168.1.10:50053`
 2. User watches an artist (full discography), album, or individual track
 3. Watched items saved to SQLite with provider + provider_id
 4. Scheduler (configurable interval, default 6h) checks each watched artist's provider for new releases
-5. Downloader processes queue: search slskd → pick best file → download → organize → tag (non-destructive: only Crate's own fields, foreign tags preserved) → notify (Navidrome / Music Assistant rescan)
+5. Downloader processes queue:
+   - Primary: checks `arcod.xyz` for high-quality lossless FLAC (up to 24-bit 192kHz). If found, downloads stream directly via CDN, organizes, tags, and completes.
+   - Secondary / Fallback: if not found or on error, falls back to slskd (Soulseek) search → pick best file → download → organize → tag (non-destructive) → notify (Navidrome / Music Assistant rescan)
 6. Track status: `wanted` → `downloading` → `owned`
 
 ## Download Retry, Blacklist & Shadow Bans
@@ -87,7 +89,7 @@ For external providers: `CRATE_PROVIDERS=spotify:external:192.168.1.10:50053`
 Manual search is async — the frontend starts a search, then polls for results as peers respond. See [ADR-0002](docs/adr/0002-async-manual-search.md).
 
 1. `POST /api/tracks/{id}/search` → `{search_id, track_id}` — starts slskd search, returns immediately
-2. `GET /api/tracks/{id}/search/{searchId}` → `{results: [...], is_complete: bool, file_count: int}` — poll for scored results. Results are **unfiltered** (every slskd file — see [ADR-0003](docs/adr/0003-manual-search-no-filter.md)); each carries `score` plus `blacklisted`/`locked`/`negative_match` annotation flags.
+2. `GET /api/tracks/{id}/search/{searchId}` → `{results: [...], is_complete: bool, file_count: int}` — poll for scored results. Results include primary Arcod (Qobuz FLAC) direct streams at the top plus **unfiltered** slskd peer files (see [ADR-0003](docs/adr/0003-manual-search-no-filter.md)); each carries `score` plus `blacklisted`/`locked`/`negative_match` annotation flags.
 3. `DELETE /api/tracks/{id}/search/{searchId}` — cleanup when done
 
 Frontend polls every 2s, shows results as they arrive with a spinner until `is_complete`. Cleanup runs on unmount and when the user closes the search panel.

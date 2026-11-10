@@ -17,6 +17,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/config"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/musicassistant"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/navidrome"
@@ -64,6 +65,9 @@ func main() {
 	slskdClient := slskd.NewClient(cfg.SlskdURL, cfg.SlskdAPIKey)
 	org := organizer.NewService(queries, cfg.DownloadsDir, cfg.LibraryPath)
 	dl := downloader.NewService(queries, slskdClient, org, actLog)
+	dl.SetDownloadsDir(cfg.DownloadsDir)
+	arcodClient := arcod.NewClient(queries, cfg.DownloadsDir)
+	dl.SetArcod(arcodClient)
 	dl.AddNotifier(navidrome.NewClient(queries))
 	server := api.NewServer(queries, providerMgr, providerCache, dl, actLog, frontendFS, cfg.LibraryPath, Version)
 

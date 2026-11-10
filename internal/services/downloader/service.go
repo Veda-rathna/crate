@@ -5,20 +5,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
 )
 
 const defaultMaxConcurrentSlskd = 10
+
+var unsafeFilenameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
+
+func sanitizeFilename(s string) string {
+	return strings.TrimSpace(unsafeFilenameChars.ReplaceAllString(s, "_"))
+}
 
 var supportedExts = map[string]bool{
 	".flac": true,
@@ -43,16 +53,49 @@ type PostDownloadNotifier interface {
 	TriggerScan(ctx context.Context)
 }
 
+type ArcodProvider interface {
+	Search(ctx context.Context, query string) ([]arcod.TrackItem, error)
+	FindBestTrack(ctx context.Context, artistName, trackTitle string) (*arcod.TrackItem, error)
+	DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error)
+	IsEnabled() bool
+}
+
+type arcodCacheEntry struct {
+	results  []ManualSearchResult
+	cachedAt time.Time
+}
+
 type Service struct {
-	queries     *db.Queries
-	slskd       *slskd.Client
-	organizer   Organizer
-	activityLog *activity.Log
-	notifiers   []PostDownloadNotifier
+	queries          *db.Queries
+	slskd            *slskd.Client
+	organizer        Organizer
+	activityLog      *activity.Log
+	notifiers        []PostDownloadNotifier
+	arcod            ArcodProvider
+	downloadsDir     string
+	arcodSearchCache sync.Map
 }
 
 func NewService(queries *db.Queries, slskdClient *slskd.Client, org Organizer, actLog *activity.Log) *Service {
 	return &Service{queries: queries, slskd: slskdClient, organizer: org, activityLog: actLog}
+}
+
+func (s *Service) SetArcod(a ArcodProvider) {
+	s.arcod = a
+}
+
+func (s *Service) SetDownloadsDir(dir string) {
+	s.downloadsDir = dir
+}
+
+func (s *Service) getDownloadsDir() string {
+	if s.downloadsDir != "" {
+		return s.downloadsDir
+	}
+	if v := os.Getenv("CRATE_DOWNLOADS_DIR"); v != "" {
+		return v
+	}
+	return "./downloads"
 }
 
 func (s *Service) AddNotifier(n PostDownloadNotifier) {
@@ -65,6 +108,9 @@ func (s *Service) Notifiers() []PostDownloadNotifier {
 
 func (s *Service) CancelTransfer(ctx context.Context, d *models.DownloadQueueItem) {
 	if d.SlskdSearchID == nil {
+		return
+	}
+	if strings.HasPrefix(*d.SlskdSearchID, "arcod|") {
 		return
 	}
 	switch d.Status {
@@ -103,6 +149,21 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 	}
 
 	var items []ProgressItem
+	for _, d := range downloading {
+		if d.SlskdSearchID != nil && strings.HasPrefix(*d.SlskdSearchID, "arcod|") {
+			track, _ := s.queries.GetTrackWithMeta(d.TrackID)
+			title := "Unknown"
+			if track != nil {
+				title = fmt.Sprintf("%s - %s", track.ArtistName, track.Title)
+			}
+			items = append(items, ProgressItem{
+				Username:        "arcod (Direct FLAC)",
+				Filename:        title + ".flac",
+				PercentComplete: 50,
+				State:           "Downloading",
+			})
+		}
+	}
 	for _, ud := range dirs {
 		for _, dir := range ud.Directories {
 			for _, f := range dir.Files {
@@ -271,6 +332,13 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 		return err
 	}
 
+	// Try Arcod first if enabled
+	if s.arcod != nil && s.arcod.IsEnabled() {
+		if s.tryArcodDownload(ctx, d, track) {
+			return nil
+		}
+	}
+
 	query := track.ArtistName + " " + track.Title
 	slog.Info("downloader: searching", "query", query, "track_id", track.ID)
 	s.logActivity("search_started", "track", track.ID,
@@ -282,6 +350,60 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 	}
 
 	return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusSearching, &search.ID, nil)
+}
+
+func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueItem, track *models.Track) bool {
+	slog.Info("downloader: checking arcod primary source", "artist", track.ArtistName, "title", track.Title, "track_id", track.ID)
+	arcodTrack, err := s.arcod.FindBestTrack(ctx, track.ArtistName, track.Title)
+	if err != nil {
+		slog.Warn("downloader: arcod search error, falling back to slskd", "error", err, "track_id", track.ID)
+		return false
+	}
+	if arcodTrack == nil {
+		slog.Info("downloader: no match on arcod, falling back to slskd", "artist", track.ArtistName, "title", track.Title)
+		return false
+	}
+
+	slog.Info("downloader: match found on arcod, downloading lossless FLAC", "track_id", track.ID, "arcod_id", arcodTrack.ID, "title", arcodTrack.Title)
+	s.logActivity("download_started", "track", track.ID,
+		fmt.Sprintf("Downloading FLAC from arcod: %s - %s", track.ArtistName, track.Title))
+
+	destFileName := sanitizeFilename(fmt.Sprintf("%s - %s.flac", track.ArtistName, track.Title))
+	destPath := filepath.Join(s.getDownloadsDir(), destFileName)
+
+	arcodKey := fmt.Sprintf("arcod|%d", arcodTrack.ID)
+	_ = s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusDownloading, &arcodKey, nil)
+	_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusDownloading)
+	_ = s.queries.UpdateTrackDownloadedFrom(track.ID, "arcod")
+	_ = s.queries.UpdateTrackDownloadedFilename(track.ID, destFileName)
+	_ = s.queries.UpdateTrackQuality(track.ID, "flac", 0)
+
+	_, err = s.arcod.DownloadTrack(ctx, arcodTrack.ID, 27, destPath)
+	if err != nil {
+		slog.Warn("downloader: arcod stream download failed, falling back to slskd", "error", err, "track_id", track.ID)
+		_ = os.Remove(destPath)
+		return false
+	}
+
+	if err := s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusOrganizing, &arcodKey, nil); err != nil {
+		slog.Error("downloader: update status to organizing failed", "error", err)
+		return false
+	}
+
+	trackCopy := *track
+	trackCopy.FilePath = &destFileName
+	if err := s.organizer.Organize(&trackCopy); err != nil {
+		slog.Error("downloader: organize arcod download failed, will retry", "filename", destFileName, "track_id", track.ID, "error", err)
+		return true // remain in organizing state so retryOrganize handles it
+	}
+
+	s.logActivity("download_complete", "track", track.ID,
+		fmt.Sprintf("Downloaded lossless FLAC from arcod: %s - %s", track.ArtistName, track.Title))
+	for _, n := range s.notifiers {
+		n.TriggerScan(ctx)
+	}
+	_ = s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusComplete, &arcodKey, nil)
+	return true
 }
 
 // checkSearch polls a search and initiates download when results are ready.
@@ -355,6 +477,9 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 // checkDownload polls an active transfer and marks complete when done.
 func (s *Service) checkDownload(ctx context.Context, d models.DownloadQueueItem) error {
 	if d.SlskdSearchID == nil {
+		return nil
+	}
+	if strings.HasPrefix(*d.SlskdSearchID, "arcod|") {
 		return nil
 	}
 
@@ -567,11 +692,75 @@ func (s *Service) PollManualSearch(ctx context.Context, trackID int64, searchID 
 	cfg.includeAll = true // manual search surfaces every slskd result; the user picks
 	candidates := scoreCandidates(search.Responses, track, nil, cfg)
 
+	formatted := formatCandidates(candidates, s.queries, cfg.negativeKeywords, track)
+	if s.arcod != nil && s.arcod.IsEnabled() {
+		arcodRes := s.getArcodManualResults(ctx, trackID, track)
+		formatted = append(arcodRes, formatted...)
+	}
+
 	return &ManualSearchResponse{
-		Results:    formatCandidates(candidates, s.queries, cfg.negativeKeywords, track),
+		Results:    formatted,
 		IsComplete: search.IsComplete,
 		FileCount:  search.FileCount,
 	}, nil
+}
+
+func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, track *models.Track) []ManualSearchResult {
+	if val, ok := s.arcodSearchCache.Load(trackID); ok {
+		entry := val.(arcodCacheEntry)
+		if time.Since(entry.cachedAt) < 2*time.Minute {
+			return entry.results
+		}
+	}
+
+	query := track.ArtistName + " " + track.Title
+	items, err := s.arcod.Search(ctx, query)
+	if err != nil {
+		slog.Warn("downloader: arcod manual search error", "error", err)
+		return nil
+	}
+
+	var results []ManualSearchResult
+	for _, item := range items {
+		if !item.Streamable {
+			continue
+		}
+		bitDepth := item.MaximumBitDepth
+		if bitDepth == 0 {
+			bitDepth = 16
+		}
+		sampleRate := int(item.MaximumSamplingRate * 1000)
+		if sampleRate == 0 {
+			sampleRate = 44100
+		}
+		spec := fmt.Sprintf("%d-bit/%.1fkHz", bitDepth, item.MaximumSamplingRate)
+		if item.MaximumSamplingRate == float64(int(item.MaximumSamplingRate)) {
+			spec = fmt.Sprintf("%d-bit/%dkHz", bitDepth, int(item.MaximumSamplingRate))
+		}
+		filename := fmt.Sprintf("arcod:%d/[FLAC %s] %s - %s.flac", item.ID, spec, item.Artist, item.Title)
+		results = append(results, ManualSearchResult{
+			Username:      "arcod (Direct FLAC)",
+			Filename:      filename,
+			Size:          int64(item.Duration * 1000 * 150),
+			BitRate:       0,
+			SampleRate:    sampleRate,
+			BitDepth:      bitDepth,
+			Duration:      item.Duration,
+			Format:        "FLAC",
+			Score:         120, // Primary source top priority
+			FreeSlot:      true,
+			QueueLength:   0,
+			Blacklisted:   false,
+			NegativeMatch: false,
+			Locked:        false,
+		})
+	}
+
+	s.arcodSearchCache.Store(trackID, arcodCacheEntry{
+		results:  results,
+		cachedAt: time.Now(),
+	})
+	return results
 }
 
 // CleanupSearch deletes an slskd search.
@@ -639,6 +828,63 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 	track, err := s.queries.GetTrackWithMeta(trackID)
 	if err != nil {
 		return err
+	}
+
+	if (strings.HasPrefix(username, "arcod") || strings.HasPrefix(filename, "arcod:")) && s.arcod != nil {
+		var arcodID int64
+		if strings.HasPrefix(filename, "arcod:") {
+			rest := strings.TrimPrefix(filename, "arcod:")
+			if slashIdx := strings.Index(rest, "/"); slashIdx != -1 {
+				arcodID, _ = strconv.ParseInt(rest[:slashIdx], 10, 64)
+			}
+		}
+		if arcodID == 0 {
+			best, err := s.arcod.FindBestTrack(ctx, track.ArtistName, track.Title)
+			if err == nil && best != nil {
+				arcodID = best.ID
+			}
+		}
+		if arcodID == 0 {
+			return fmt.Errorf("arcod track ID not found for %s - %s", track.ArtistName, track.Title)
+		}
+
+		destFileName := sanitizeFilename(fmt.Sprintf("%s - %s.flac", track.ArtistName, track.Title))
+		_ = s.queries.UpdateTrackDownloadedFrom(trackID, "arcod")
+		_ = s.queries.UpdateTrackDownloadedFilename(trackID, destFileName)
+		_ = s.queries.UpdateTrackQuality(trackID, "flac", 0)
+
+		dlID, err := s.queries.EnqueueDownloadReturningID(trackID)
+		if err != nil {
+			return err
+		}
+
+		transferKey := fmt.Sprintf("arcod|%d", arcodID)
+		_ = s.queries.UpdateDownloadStatus(dlID, models.DownloadStatusDownloading, &transferKey, nil)
+		_ = s.queries.UpdateTrackStatus(trackID, models.TrackStatusDownloading)
+
+		destPath := filepath.Join(s.getDownloadsDir(), destFileName)
+		_, err = s.arcod.DownloadTrack(ctx, arcodID, 27, destPath)
+		if err != nil {
+			errStr := err.Error()
+			_ = s.queries.UpdateTrackStatus(trackID, models.TrackStatusWanted)
+			_ = s.queries.UpdateDownloadStatus(dlID, models.DownloadStatusFailed, nil, &errStr)
+			return fmt.Errorf("arcod download: %w", err)
+		}
+
+		_ = s.queries.UpdateDownloadStatus(dlID, models.DownloadStatusOrganizing, &transferKey, nil)
+		trackCopy := *track
+		trackCopy.FilePath = &destFileName
+		if err := s.organizer.Organize(&trackCopy); err != nil {
+			return fmt.Errorf("organize: %w", err)
+		}
+
+		s.logActivity("download_complete", "track", trackID,
+			fmt.Sprintf("Manual download from arcod: %s - %s", track.ArtistName, track.Title))
+		for _, n := range s.notifiers {
+			n.TriggerScan(ctx)
+		}
+		_ = s.queries.UpdateDownloadStatus(dlID, models.DownloadStatusComplete, &transferKey, nil)
+		return nil
 	}
 
 	_ = s.queries.UpdateTrackDownloadedFrom(trackID, username)

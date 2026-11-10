@@ -43,7 +43,7 @@ service MusicProvider {
 Set the `CRATE_PROVIDERS` environment variable:
 
 ```
-CRATE_PROVIDERS=musicbrainz:./provider-musicbrainz:50051,deezer:./provider-deezer:50052,myprovider:./my-provider:50053
+CRATE_PROVIDERS=musicbrainz:./provider-musicbrainz:50051,deezer:./provider-deezer:50052,spotify:./provider-spotify:50053
 ```
 
 Format: `name:binary:port`. Crate starts the binary with `PORT=<port>` in its environment, waits up to 10 seconds for the gRPC server to respond to `Info()`, then registers it.
@@ -107,6 +107,14 @@ func main() {
     s.Serve(lis)
 }
 ```
+
+## Built-in Providers
+
+Crate includes three official providers out of the box:
+
+- **MusicBrainz (`cmd/provider-musicbrainz`)**: Open-source music encyclopedia with MBIDs. No API key required.
+- **Deezer (`cmd/provider-deezer`)**: Fast catalog search with 30-second preview metadata. No API key required.
+- **Spotify (`cmd/provider-spotify`)**: Comprehensive, constantly updated streaming catalog. Requires a free Spotify Developer Client ID and Client Secret (`SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET`, or configure them in Crate's Settings UI).
 
 ## Rate Limiting
 

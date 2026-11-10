@@ -1161,6 +1161,9 @@ func (s *Server) handleRelinkEntity(w http.ResponseWriter, r *http.Request) {
 var sensitiveSettings = map[string]bool{
 	"navidrome_password":    true,
 	"music_assistant_token": true,
+	"arcod_password":        true,
+	"arcod_token":           true,
+	"spotify_client_secret": true,
 }
 
 var hiddenSettings = map[string]bool{

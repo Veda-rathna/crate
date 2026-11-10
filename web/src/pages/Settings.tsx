@@ -18,10 +18,27 @@ function tierLabel(format: string, bitrate?: number): string {
 
 const settingsSections = [
   {
+    title: 'Arcod (Primary FLAC Downloader)',
+    fields: [
+      { key: 'arcod_enabled', label: 'Enabled', placeholder: 'true', description: 'Enable arcod.xyz as primary source for lossless FLAC downloads before SLSKD' },
+      { key: 'arcod_url', label: 'Arcod URL', placeholder: 'https://arcod.xyz', description: 'Base URL for arcod service' },
+      { key: 'arcod_email', label: 'Account Email', placeholder: 'user@example.com', description: 'Your arcod.xyz email for authentication' },
+      { key: 'arcod_password', label: 'Account Password', placeholder: 'Password', type: 'password', description: 'Your arcod.xyz password' },
+      { key: 'arcod_token', label: 'Auth Token (Optional)', placeholder: 'JWT Token', type: 'password', description: 'Direct Bearer token (auto-fetched if email/password provided)' },
+    ],
+  },
+  {
     title: 'slskd',
     fields: [
       { key: 'max_concurrent_slskd', label: 'Max Concurrent Downloads', placeholder: '10', type: 'number', description: 'How many files to download from Soulseek at the same time' },
       { key: 'shadow_ban_duration_minutes', label: 'Shadow Ban Duration (minutes)', placeholder: '60', type: 'number', description: 'How long to temporarily block a user after failed or stale downloads' },
+    ],
+  },
+  {
+    title: 'Spotify Provider (optional)',
+    fields: [
+      { key: 'spotify_client_id', label: 'Client ID', placeholder: 'Spotify Client ID', description: 'From developer.spotify.com/dashboard (Web API)' },
+      { key: 'spotify_client_secret', label: 'Client Secret', placeholder: 'Spotify Client Secret', type: 'password', description: 'From developer.spotify.com/dashboard' },
     ],
   },
   {
