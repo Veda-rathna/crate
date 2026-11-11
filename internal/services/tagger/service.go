@@ -15,13 +15,23 @@ import (
 )
 
 type TrackMeta struct {
-	Title       string
-	Artist      string
-	Album       string
-	TrackNumber int
-	DiscNumber  int
-	Year        int
-	CoverURL    string
+	Title          string
+	Artist         string
+	AlbumArtist    string
+	Album          string
+	TrackNumber    int
+	DiscNumber     int
+	Year           int
+	CoverURL       string
+	MBAlbumArtist  string
+	MBReleaseGroup string
+}
+
+func resolveAlbumArtist(meta TrackMeta) string {
+	if strings.TrimSpace(meta.AlbumArtist) != "" {
+		return meta.AlbumArtist
+	}
+	return meta.Artist
 }
 
 func Tag(filePath string, meta TrackMeta) error {
@@ -39,6 +49,22 @@ func Tag(filePath string, meta TrackMeta) error {
 	}
 }
 
+// conflictingMP3TXXXDescriptions lists TXXX frame descriptions that identify
+// external release/album groupings and would split a single Crate album into
+// multiple albums in players when tracks come from mixed sources.
+var conflictingMP3TXXXDescriptions = map[string]bool{
+	"musicbrainz album id":         true,
+	"musicbrainz release group id": true,
+	"musicbrainz album artist id":  true,
+	"musicbrainz album type":       true,
+	"musicbrainz album status":     true,
+	"albumartist":                  true,
+	"album artist":                 true,
+	"albumartists":                 true,
+	"originalyear":                 true,
+	"artists":                      true,
+}
+
 func tagMP3(filePath string, meta TrackMeta) error {
 	// Parse existing frames so foreign tags (UFID, TSRC, TXXX, ReplayGain, …)
 	// survive; we only replace Crate's own frames below. Opening with
@@ -49,11 +75,24 @@ func tagMP3(filePath string, meta TrackMeta) error {
 	}
 	defer tag.Close()
 
+	albumArtist := resolveAlbumArtist(meta)
+
 	tag.SetDefaultEncoding(id3v2.EncodingUTF8)
 	tag.SetTitle(meta.Title)
 	tag.SetArtist(meta.Artist)
 	tag.SetAlbum(meta.Album)
-	tag.SetYear(fmt.Sprintf("%d", meta.Year))
+
+	// Normalize album artist (TPE2) and clear stale year/compilation/sort/disc-subtitle
+	// frames so tracks sourced from different releases stay grouped as one album.
+	for _, id := range []string{"TPE2", "TDRC", "TYER", "TDOR", "TORY", "TCMP", "TSOA", "TSO2", "TSOP", "TSST"} {
+		tag.DeleteFrames(id)
+	}
+	if albumArtist != "" {
+		tag.AddTextFrame("TPE2", id3v2.EncodingUTF8, albumArtist)
+	}
+	if meta.Year > 0 {
+		tag.SetYear(fmt.Sprintf("%d", meta.Year))
+	}
 
 	// SetTitle/SetArtist/etc. replace, but AddTextFrame/AddAttachedPicture
 	// append — so clear Crate's track/disc/cover frames first, or a re-tag of
@@ -67,6 +106,36 @@ func tagMP3(filePath string, meta TrackMeta) error {
 	}
 	if meta.DiscNumber > 0 {
 		tag.AddTextFrame(discID, id3v2.EncodingUTF8, fmt.Sprintf("%d", meta.DiscNumber))
+	}
+
+	// Preserve non-conflicting TXXX frames (e.g. Acoustid Id, ReplayGain) while
+	// removing conflicting album-grouping TXXX entries.
+	txxxID := tag.CommonID("User defined text information frame")
+	var keptTXXX []id3v2.UserDefinedTextFrame
+	for _, f := range tag.GetFrames(txxxID) {
+		if udf, ok := f.(id3v2.UserDefinedTextFrame); ok {
+			if !conflictingMP3TXXXDescriptions[strings.ToLower(strings.TrimSpace(udf.Description))] {
+				keptTXXX = append(keptTXXX, udf)
+			}
+		}
+	}
+	tag.DeleteFrames(txxxID)
+	for _, udf := range keptTXXX {
+		tag.AddUserDefinedTextFrame(udf)
+	}
+	if meta.MBReleaseGroup != "" {
+		tag.AddUserDefinedTextFrame(id3v2.UserDefinedTextFrame{
+			Encoding:    id3v2.EncodingUTF8,
+			Description: "MusicBrainz Release Group Id",
+			Value:       meta.MBReleaseGroup,
+		})
+	}
+	if meta.MBAlbumArtist != "" {
+		tag.AddUserDefinedTextFrame(id3v2.UserDefinedTextFrame{
+			Encoding:    id3v2.EncodingUTF8,
+			Description: "MusicBrainz Album Artist Id",
+			Value:       meta.MBAlbumArtist,
+		})
 	}
 
 	if meta.CoverURL != "" {
@@ -84,18 +153,39 @@ func tagMP3(filePath string, meta TrackMeta) error {
 	return tag.Save()
 }
 
-// crateOwnedFLACFields are the Vorbis comments Crate manages. On (re-)tag we
-// overwrite only these and preserve every other field — ReplayGain,
-// MusicBrainz, AcoustID, ISRC, etc. written by other tools such as Music
-// Assistant's analysis providers. Rebuilding a fresh comment block (the old
-// behavior) silently wiped those.
+// crateOwnedFLACFields are the Vorbis comments Crate manages or strips to ensure
+// every track of a downloaded album carries consistent album-grouping metadata,
+// while preserving non-album foreign tags (ReplayGain, MUSICBRAINZ_TRACKID,
+// AcoustID, ISRC, etc.).
 var crateOwnedFLACFields = map[string]bool{
-	"TITLE":       true,
-	"ARTIST":      true,
-	"ALBUM":       true,
-	"TRACKNUMBER": true,
-	"DISCNUMBER":  true,
-	"DATE":        true,
+	"TITLE":                     true,
+	"ARTIST":                    true,
+	"ALBUMARTIST":               true,
+	"ALBUM ARTIST":              true,
+	"ALBUMARTISTS":              true,
+	"ALBUM_ARTIST":              true,
+	"ALBUM":                     true,
+	"TRACKNUMBER":               true,
+	"DISCNUMBER":                true,
+	"DATE":                      true,
+	"YEAR":                      true,
+	"ORIGINALDATE":              true,
+	"ORIGINALYEAR":              true,
+	"ALBUMSORT":                 true,
+	"ALBUMARTISTSORT":           true,
+	"ARTISTSORT":                true,
+	"COMPILATION":               true,
+	"ITUNESCOMPILATION":         true,
+	"DISCSUBTITLE":              true,
+	"SETSUBTITLE":               true,
+	"DISCTOTAL":                 true,
+	"TOTALDISCS":                true,
+	"TRACKTOTAL":                true,
+	"TOTALTRACKS":               true,
+	"MUSICBRAINZ_ALBUMID":       true,
+	"MUSICBRAINZ_RELEASEGROUPID": true,
+	"MUSICBRAINZ_ALBUMARTISTID": true,
+	"RELEASETYPE":               true,
 }
 
 func tagFLAC(filePath string, meta TrackMeta) error {
@@ -104,9 +194,10 @@ func tagFLAC(filePath string, meta TrackMeta) error {
 		return fmt.Errorf("tagger: open flac: %w", err)
 	}
 
-	// Start from the existing comments so foreign fields survive; only strip
-	// the fields Crate is about to rewrite. Falls back to a fresh block when
-	// the file has no (or an unparseable) Vorbis comment block.
+	albumArtist := resolveAlbumArtist(meta)
+
+	// Start from the existing comments so foreign fields survive; strip only
+	// Crate-owned and conflicting album-grouping fields before rewriting.
 	cmtIdx := -1
 	cmt := flacvorbis.New()
 	for i, block := range f.Meta {
@@ -131,11 +222,22 @@ func tagFLAC(filePath string, meta TrackMeta) error {
 
 	cmt.Add(flacvorbis.FIELD_TITLE, meta.Title)
 	cmt.Add(flacvorbis.FIELD_ARTIST, meta.Artist)
+	if albumArtist != "" {
+		cmt.Add("ALBUMARTIST", albumArtist)
+	}
 	cmt.Add(flacvorbis.FIELD_ALBUM, meta.Album)
 	cmt.Add(flacvorbis.FIELD_TRACKNUMBER, fmt.Sprintf("%d", meta.TrackNumber))
-	cmt.Add("DISCNUMBER", fmt.Sprintf("%d", meta.DiscNumber))
+	if meta.DiscNumber > 0 {
+		cmt.Add("DISCNUMBER", fmt.Sprintf("%d", meta.DiscNumber))
+	}
 	if meta.Year > 0 {
 		cmt.Add("DATE", fmt.Sprintf("%d", meta.Year))
+	}
+	if meta.MBReleaseGroup != "" {
+		cmt.Add("MUSICBRAINZ_RELEASEGROUPID", meta.MBReleaseGroup)
+	}
+	if meta.MBAlbumArtist != "" {
+		cmt.Add("MUSICBRAINZ_ALBUMARTISTID", meta.MBAlbumArtist)
 	}
 
 	cmtBlock := cmt.Marshal()

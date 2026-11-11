@@ -463,3 +463,17 @@ func TestImportRejectsBadPath(t *testing.T) {
 		t.Error("expected error for missing directory")
 	}
 }
+
+func TestImportMultiDiscAndFeatStayOneAlbum(t *testing.T) {
+	env := newImpEnv(t)
+	dir := filepath.Join(env.library, "Pink Floyd", "The Wall")
+	writeFLACFixture(t, filepath.Join(dir, "1-01.flac"),
+		trackTags{artist: "Pink Floyd", album: "The Wall (Disc 1)", title: "In the Flesh?", track: 1, disc: 1, year: 1979})
+	writeFLACFixture(t, filepath.Join(dir, "2-01.flac"),
+		trackTags{artist: "Pink Floyd feat. Guest", album: "The Wall (Disc 2)", title: "Hey You", track: 1, disc: 2, year: 1979})
+
+	report := env.runImport(t, "", false)
+	if report.ArtistsAdded != 1 || report.AlbumsAdded != 1 || report.TracksAdded != 2 {
+		t.Fatalf("expected 1 artist / 1 album / 2 tracks, got %+v", report)
+	}
+}

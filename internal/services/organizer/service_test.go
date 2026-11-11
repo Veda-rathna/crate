@@ -1,9 +1,14 @@
 package organizer
 
 import (
+	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/go-flac/flacvorbis"
+	flac "github.com/go-flac/go-flac"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
@@ -250,5 +255,148 @@ func TestCopyFileSrcMissing(t *testing.T) {
 	err := copyFile(filepath.Join(dir, "nope"), filepath.Join(dir, "dst"))
 	if err == nil {
 		t.Error("expected error for missing source")
+	}
+}
+
+func writeValidMinimalFLAC(t *testing.T, path string, comments map[string]string) {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.WriteString("fLaC")
+	buf.WriteByte(0x80)
+	buf.Write([]byte{0x00, 0x00, 0x22})
+	si := make([]byte, 34)
+	binary.BigEndian.PutUint16(si[0:2], 4096)
+	binary.BigEndian.PutUint16(si[2:4], 4096)
+	si[10] = 0xAC
+	si[11] = 0x44
+	si[12] = byte((44100&0xF)<<4) | byte(1<<1) | byte(15>>4)
+	si[13] = byte(15&0xF) << 4
+	buf.Write(si)
+	buf.Write([]byte{0xFF, 0xF8, 0x00, 0x00})
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) > 0 {
+		f, err := flac.ParseFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmt := flacvorbis.New()
+		for k, v := range comments {
+			cmt.Add(k, v)
+		}
+		block := cmt.Marshal()
+		f.Meta = append(f.Meta, &block)
+		if err := f.Save(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestOrganizeMultipleSourcesStayOneAlbum(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	queries := db.NewQueries(database)
+
+	artist := &models.Artist{Name: "Anirudh Ravichander", Provider: "spotify", ProviderID: "ar1", Status: models.ArtistStatusWatched}
+	if err := queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	yr := 2023
+	album := &models.Album{ArtistID: artist.ID, Title: "Jailer", Year: &yr, Provider: "spotify", ProviderID: "al1", RecordType: "album", Status: models.AlbumStatusWatched}
+	if err := queries.CreateAlbum(album); err != nil {
+		t.Fatal(err)
+	}
+	tr1 := &models.Track{AlbumID: album.ID, Title: "Hukum", TrackNumber: 1, DiscNumber: 1, Provider: "spotify", ProviderID: "t1", Status: models.TrackStatusWanted}
+	tr2 := &models.Track{AlbumID: album.ID, Title: "Kaavaalaa", TrackNumber: 2, DiscNumber: 1, Provider: "spotify", ProviderID: "t2", Status: models.TrackStatusWanted}
+	if err := queries.CreateTrack(tr1); err != nil {
+		t.Fatal(err)
+	}
+	if err := queries.CreateTrack(tr2); err != nil {
+		t.Fatal(err)
+	}
+
+	downloads := t.TempDir()
+	lib := t.TempDir()
+	svc := NewService(queries, downloads, lib)
+
+	f1 := "1 - Anirudh - Hukum.flac"
+	f2 := "02 - Kaavaalaa.flac"
+	writeValidMinimalFLAC(t, filepath.Join(downloads, f1), map[string]string{
+		"ALBUMARTIST":         "Anirudh Ravichander",
+		"ALBUM":               "Jailer (Original Motion Picture Soundtrack)",
+		"MUSICBRAINZ_ALBUMID": "mb-1",
+	})
+	writeValidMinimalFLAC(t, filepath.Join(downloads, f2), map[string]string{
+		"ALBUMARTIST":         "Shilpa Rao, Anirudh Ravichander",
+		"ALBUM ARTIST":        "Various Artists",
+		"ALBUM":               "Jailer - Single",
+		"COMPILATION":         "1",
+		"MUSICBRAINZ_ALBUMID": "mb-2",
+	})
+
+	tr1.FilePath = &f1
+	tr2.FilePath = &f2
+	if err := svc.Organize(tr1); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Organize(tr2); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rel := range []string{
+		filepath.Join("Anirudh Ravichander", "Jailer (2023)", "01 - Hukum.flac"),
+		filepath.Join("Anirudh Ravichander", "Jailer (2023)", "02 - Kaavaalaa.flac"),
+	} {
+		parsed, err := flac.ParseFile(filepath.Join(lib, rel))
+		if err != nil {
+			t.Fatalf("parse %s: %v", rel, err)
+		}
+		var cmt *flacvorbis.MetaDataBlockVorbisComment
+		for _, b := range parsed.Meta {
+			if b.Type == flac.VorbisComment {
+				cmt, _ = flacvorbis.ParseFromMetaDataBlock(*b)
+			}
+		}
+		if cmt == nil {
+			t.Fatalf("no vorbis comments in %s", rel)
+		}
+		if v, _ := cmt.Get("ALBUMARTIST"); len(v) != 1 || v[0] != "Anirudh Ravichander" {
+			t.Errorf("%s ALBUMARTIST = %v, want [Anirudh Ravichander]", rel, v)
+		}
+		if v, _ := cmt.Get("ALBUM"); len(v) != 1 || v[0] != "Jailer" {
+			t.Errorf("%s ALBUM = %v, want [Jailer]", rel, v)
+		}
+		if v, _ := cmt.Get("COMPILATION"); len(v) != 0 {
+			t.Errorf("%s COMPILATION should be stripped, got %v", rel, v)
+		}
+		if v, _ := cmt.Get("MUSICBRAINZ_ALBUMID"); len(v) != 0 {
+			t.Errorf("%s MUSICBRAINZ_ALBUMID should be stripped, got %v", rel, v)
+		}
+	}
+}
+
+func TestFindFileWithHintAvoidsCollision(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "user1", "Album A", "01 - Intro.flac")
+	pathB := filepath.Join(dir, "user2", "Album B", "01 - Intro.flac")
+	os.MkdirAll(filepath.Dir(pathA), 0755)
+	os.MkdirAll(filepath.Dir(pathB), 0755)
+	os.WriteFile(pathA, []byte("A"), 0644)
+	os.WriteFile(pathB, []byte("B"), 0644)
+
+	got, err := findFileWithHint(dir, "01 - Intro.flac", `@@user2\Music\Album B\01 - Intro.flac`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != pathB {
+		t.Errorf("findFileWithHint = %q, want %q", got, pathB)
 	}
 }

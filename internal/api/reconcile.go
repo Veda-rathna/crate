@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
@@ -152,28 +153,42 @@ func (s *Server) albumHasLocalTracks(albumID int64) bool {
 	return false
 }
 
-// matchLocalAlbum returns the first unused local album whose title folds equal
-// to pa and whose year is compatible (equal, or unknown on either side). The
-// year guard stops a same-titled but distinct release (a re-record, a reissue
-// under the same name) from being merged.
+// matchLocalAlbum returns the best unused local album whose title matches pa
+// (exact case-fold first, then relaxed normalized title match) and whose year
+// is compatible (equal, or unknown on either side). The year guard stops a
+// same-titled but distinct release (a re-record, a reissue under the same name)
+// from being merged.
 func matchLocalAlbum(locals []*models.Album, used map[int64]bool, pa *pb.AlbumSummary) *models.Album {
+	yearCompatible := func(a *models.Album) bool {
+		return a.Year == nil || pa.Year == 0 || *a.Year == int(pa.Year)
+	}
 	for _, a := range locals {
-		if used[a.ID] || !foldEqual(a.Title, pa.Title) {
-			continue
-		}
-		if a.Year != nil && pa.Year != 0 && *a.Year != int(pa.Year) {
+		if used[a.ID] || !foldEqual(a.Title, pa.Title) || !yearCompatible(a) {
 			continue
 		}
 		return a
 	}
+	for _, a := range locals {
+		if used[a.ID] || !yearCompatible(a) {
+			continue
+		}
+		if matching.TitlesMatch(pa.Title, a.Title) {
+			m1, _ := matching.HasUnrequestedVariant(a.Title, pa.Title)
+			m2, _ := matching.HasUnrequestedVariant(pa.Title, a.Title)
+			if !m1 && !m2 {
+				return a
+			}
+		}
+	}
 	return nil
 }
 
-// matchLocalTrack returns the best unused local track for pt: an exact
-// title-fold match, preferring one whose disc/track number also matches when
-// several share a title. There is deliberately no number-only fallback — an
-// unmatched local track is left owned + local for the user to link manually,
-// never force-matched onto a title it doesn't share.
+// matchLocalTrack returns the best unused local track for pt: exact title-fold
+// match first, then relaxed normalized title match, preferring one whose
+// disc/track number also matches when several share a title. There is
+// deliberately no number-only fallback — an unmatched local track is left
+// owned + local for the user to link manually, never force-matched onto a
+// title it doesn't share.
 func matchLocalTrack(locals []*models.Track, used map[int64]bool, pt *pb.TrackInfo) *models.Track {
 	var titleOnly *models.Track
 	for _, t := range locals {
@@ -187,7 +202,33 @@ func matchLocalTrack(locals []*models.Track, used map[int64]bool, pt *pb.TrackIn
 			titleOnly = t
 		}
 	}
-	return titleOnly
+	if titleOnly != nil {
+		return titleOnly
+	}
+	var relaxedBest *models.Track
+	bestQuality := 0
+	for _, t := range locals {
+		if used[t.ID] {
+			continue
+		}
+		q := matching.TitleMatchQuality(pt.Title, t.Title)
+		if q == 0 {
+			continue
+		}
+		m1, _ := matching.HasUnrequestedVariant(t.Title, pt.Title)
+		m2, _ := matching.HasUnrequestedVariant(pt.Title, t.Title)
+		if m1 || m2 {
+			continue
+		}
+		if t.TrackNumber == int(pt.TrackNumber) && t.DiscNumber == int(pt.DiscNumber) {
+			return t
+		}
+		if q > bestQuality {
+			bestQuality = q
+			relaxedBest = t
+		}
+	}
+	return relaxedBest
 }
 
 func foldEqual(a, b string) bool {

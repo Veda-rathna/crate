@@ -608,13 +608,13 @@
             </tr>
             <tr>
               <td><code>quality_tiers</code></td>
-              <td><code>FLAC &gt; MP3 320 &gt; MP3 256</code></td>
-              <td>Priority-ordered list of acceptable download formats. The downloader picks the highest-tier match from available sources. Stored as JSON.</td>
+              <td><code>FLAC</code></td>
+              <td>Priority-ordered list of acceptable download formats. The downloader picks the highest-quality match from available sources (preferring 24-bit/192kHz &gt; 24-bit/96kHz &gt; 16-bit FLAC). Stored as JSON.</td>
             </tr>
             <tr>
               <td><code>quality_fallback_enabled</code></td>
-              <td><code>true</code></td>
-              <td>Whether to accept files outside configured quality tiers. When disabled, only files matching a tier are downloaded.</td>
+              <td><code>false</code></td>
+              <td>Whether to accept files outside configured quality tiers. When disabled (default), only files matching a tier are downloaded.</td>
             </tr>
             <tr>
               <td><code>negative_keywords</code></td>
@@ -895,7 +895,7 @@
       <p>The title must appear in the filename (hard filter). All bonuses combined (max 45) can overcome one quality tier gap but never two, ensuring your quality preferences are respected while still favoring available, correctly-labeled sources.</p>
 
       <div class="callout">
-        <strong>Quality fallback:</strong> When <code>quality_fallback_enabled</code> is set to <code>false</code>, files that don't match any configured tier are rejected entirely. When enabled (default), they receive a reduced score below the lowest tier.
+        <strong>Quality fallback:</strong> When <code>quality_fallback_enabled</code> is set to <code>false</code> (default), files that don't match any configured tier are rejected entirely. When enabled, they receive a reduced score below the lowest tier.
       </div>
 
       <div class="callout">
@@ -912,7 +912,7 @@
       <p>Crate continuously improves your library quality. The quality system works as follows:</p>
 
       <ol>
-        <li><strong>Quality tiers</strong> are priority-ordered in settings (default: FLAC &gt; MP3 320 &gt; MP3 256). Higher in the list = better.</li>
+        <li><strong>Quality tiers</strong> are priority-ordered in settings (default: FLAC only). Higher in the list = better.</li>
         <li>When a track is downloaded, its format and bitrate are recorded.</li>
         <li>The scheduler scans one artist per day (round-robin), checking if any owned tracks can be upgraded to a higher quality tier.</li>
         <li>Upgradeable tracks are re-queued automatically. The new download replaces the old file.</li>

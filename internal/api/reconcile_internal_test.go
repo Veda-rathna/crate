@@ -118,3 +118,34 @@ func TestMatchLocalTrack(t *testing.T) {
 		}
 	})
 }
+
+func TestMatchLocalAlbumRelaxed(t *testing.T) {
+	locals := []*models.Album{
+		{ID: 1, Title: "OK Computer [Deluxe Edition]", Year: yptr(1997)},
+		{ID: 2, Title: "Cafe del Mar", Year: yptr(2001)},
+	}
+	if got := matchLocalAlbum(locals, map[int64]bool{}, &pb.AlbumSummary{Title: "OK Computer", Year: 1997}); got == nil || got.ID != 1 {
+		t.Errorf("expected relaxed album match for OK Computer, got %+v", got)
+	}
+	if got := matchLocalAlbum(locals, map[int64]bool{}, &pb.AlbumSummary{Title: "Café del Mar", Year: 2001}); got == nil || got.ID != 2 {
+		t.Errorf("expected relaxed diacritic album match, got %+v", got)
+	}
+	// Year guard must still block distinct year releases even with relaxed title
+	if got := matchLocalAlbum(locals, map[int64]bool{}, &pb.AlbumSummary{Title: "OK Computer", Year: 2017}); got != nil {
+		t.Errorf("expected year guard to block 1997 vs 2017, got %+v", got)
+	}
+}
+
+func TestMatchLocalTrackRelaxed(t *testing.T) {
+	locals := []*models.Track{
+		{ID: 1, Title: "Dont Let Me Down", TrackNumber: 1, DiscNumber: 1},
+		{ID: 2, Title: "Dreams (Live)", TrackNumber: 2, DiscNumber: 1},
+	}
+	if got := matchLocalTrack(locals, map[int64]bool{}, &pb.TrackInfo{Title: "Don’t Let Me Down (2023 Remaster)", TrackNumber: 1, DiscNumber: 1}); got == nil || got.ID != 1 {
+		t.Errorf("expected relaxed track match, got %+v", got)
+	}
+	// Studio track should not force-match a Live local track
+	if got := matchLocalTrack(locals, map[int64]bool{}, &pb.TrackInfo{Title: "Dreams", TrackNumber: 2, DiscNumber: 1}); got != nil {
+		t.Errorf("expected studio Dreams not to match Dreams (Live), got %+v", got)
+	}
+}

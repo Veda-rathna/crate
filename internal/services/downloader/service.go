@@ -17,6 +17,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/language"
+	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
@@ -56,6 +57,7 @@ type PostDownloadNotifier interface {
 type ArcodProvider interface {
 	Search(ctx context.Context, query string) ([]arcod.TrackItem, error)
 	FindBestTrack(ctx context.Context, artistName, trackTitle string) (*arcod.TrackItem, error)
+	FindBestTrackMatch(ctx context.Context, q arcod.MatchQuery) (*arcod.TrackItem, error)
 	DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error)
 	IsEnabled() bool
 }
@@ -339,7 +341,7 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 		}
 	}
 
-	query := track.ArtistName + " " + track.Title
+	query := matching.CleanSearchQuery(track.ArtistName, track.Title)
 	slog.Info("downloader: searching", "query", query, "track_id", track.ID)
 	s.logActivity("search_started", "track", track.ID,
 		fmt.Sprintf("Searching for: %s - %s", track.ArtistName, track.Title))
@@ -353,8 +355,13 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 }
 
 func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueItem, track *models.Track) bool {
-	slog.Info("downloader: checking arcod primary source", "artist", track.ArtistName, "title", track.Title, "track_id", track.ID)
-	arcodTrack, err := s.arcod.FindBestTrack(ctx, track.ArtistName, track.Title)
+	slog.Info("downloader: checking arcod primary source", "artist", track.ArtistName, "title", track.Title, "album", track.AlbumTitle, "track_id", track.ID)
+	arcodTrack, err := s.arcod.FindBestTrackMatch(ctx, arcod.MatchQuery{
+		Artist:     track.ArtistName,
+		Title:      track.Title,
+		Album:      track.AlbumTitle,
+		DurationMs: track.DurationMs,
+	})
 	if err != nil {
 		slog.Warn("downloader: arcod search error, falling back to slskd", "error", err, "track_id", track.ID)
 		return false
@@ -368,7 +375,7 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 	s.logActivity("download_started", "track", track.ID,
 		fmt.Sprintf("Downloading FLAC from arcod: %s - %s", track.ArtistName, track.Title))
 
-	destFileName := sanitizeFilename(fmt.Sprintf("%s - %s.flac", track.ArtistName, track.Title))
+	destFileName := sanitizeFilename(fmt.Sprintf("%d - %s - %s.flac", track.ID, track.ArtistName, track.Title))
 	destPath := filepath.Join(s.getDownloadsDir(), destFileName)
 
 	arcodKey := fmt.Sprintf("arcod|%d", arcodTrack.ID)
@@ -378,10 +385,11 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 	_ = s.queries.UpdateTrackDownloadedFilename(track.ID, destFileName)
 	_ = s.queries.UpdateTrackQuality(track.ID, "flac", 0)
 
-	_, err = s.arcod.DownloadTrack(ctx, arcodTrack.ID, 27, destPath)
+	_, err = s.arcod.DownloadTrack(ctx, arcodTrack.ID, arcod.DefaultQuality, destPath)
 	if err != nil {
 		slog.Warn("downloader: arcod stream download failed, falling back to slskd", "error", err, "track_id", track.ID)
 		_ = os.Remove(destPath)
+		_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
 		return false
 	}
 
@@ -657,7 +665,7 @@ func (s *Service) StartManualSearch(ctx context.Context, trackID int64, customQu
 	if err != nil {
 		return "", "", err
 	}
-	query := track.ArtistName + " " + track.Title
+	query := matching.CleanSearchQuery(track.ArtistName, track.Title)
 	if customQuery != "" {
 		query = customQuery
 	}
@@ -713,7 +721,7 @@ func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, trac
 		}
 	}
 
-	query := track.ArtistName + " " + track.Title
+	query := matching.CleanSearchQuery(track.ArtistName, track.Title)
 	items, err := s.arcod.Search(ctx, query)
 	if err != nil {
 		slog.Warn("downloader: arcod manual search error", "error", err)
@@ -738,6 +746,16 @@ func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, trac
 			spec = fmt.Sprintf("%d-bit/%dkHz", bitDepth, int(item.MaximumSamplingRate))
 		}
 		filename := fmt.Sprintf("arcod:%d/[FLAC %s] %s - %s.flac", item.ID, spec, item.Artist, item.Title)
+		score := 120
+		if bitDepth >= 24 && sampleRate >= 176400 {
+			score = 135
+		} else if bitDepth >= 24 && sampleRate >= 88200 {
+			score = 130
+		} else if bitDepth >= 24 {
+			score = 126
+		} else if sampleRate >= 48000 {
+			score = 122
+		}
 		results = append(results, ManualSearchResult{
 			Username:      "arcod (Direct FLAC)",
 			Filename:      filename,
@@ -747,7 +765,7 @@ func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, trac
 			BitDepth:      bitDepth,
 			Duration:      item.Duration,
 			Format:        "FLAC",
-			Score:         120, // Primary source top priority
+			Score:         score,
 			FreeSlot:      true,
 			QueueLength:   0,
 			Blacklisted:   false,
@@ -755,6 +773,16 @@ func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, trac
 			Locked:        false,
 		})
 	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		if results[i].BitDepth != results[j].BitDepth {
+			return results[i].BitDepth > results[j].BitDepth
+		}
+		return results[i].SampleRate > results[j].SampleRate
+	})
 
 	s.arcodSearchCache.Store(trackID, arcodCacheEntry{
 		results:  results,
@@ -839,7 +867,12 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 			}
 		}
 		if arcodID == 0 {
-			best, err := s.arcod.FindBestTrack(ctx, track.ArtistName, track.Title)
+			best, err := s.arcod.FindBestTrackMatch(ctx, arcod.MatchQuery{
+				Artist:     track.ArtistName,
+				Title:      track.Title,
+				Album:      track.AlbumTitle,
+				DurationMs: track.DurationMs,
+			})
 			if err == nil && best != nil {
 				arcodID = best.ID
 			}
@@ -848,7 +881,7 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 			return fmt.Errorf("arcod track ID not found for %s - %s", track.ArtistName, track.Title)
 		}
 
-		destFileName := sanitizeFilename(fmt.Sprintf("%s - %s.flac", track.ArtistName, track.Title))
+		destFileName := sanitizeFilename(fmt.Sprintf("%d - %s - %s.flac", track.ID, track.ArtistName, track.Title))
 		_ = s.queries.UpdateTrackDownloadedFrom(trackID, "arcod")
 		_ = s.queries.UpdateTrackDownloadedFilename(trackID, destFileName)
 		_ = s.queries.UpdateTrackQuality(trackID, "flac", 0)
@@ -863,7 +896,7 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 		_ = s.queries.UpdateTrackStatus(trackID, models.TrackStatusDownloading)
 
 		destPath := filepath.Join(s.getDownloadsDir(), destFileName)
-		_, err = s.arcod.DownloadTrack(ctx, arcodID, 27, destPath)
+		_, err = s.arcod.DownloadTrack(ctx, arcodID, arcod.DefaultQuality, destPath)
 		if err != nil {
 			errStr := err.Error()
 			_ = s.queries.UpdateTrackStatus(trackID, models.TrackStatusWanted)
@@ -916,8 +949,14 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 }
 
 func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac availabilityChecker, cfg scoringConfig) []candidate {
-	titleLower := strings.ToLower(track.Title)
-	artistLower := strings.ToLower(track.ArtistName)
+	var title, artist, album string
+	var durationMs int
+	if track != nil {
+		title = track.Title
+		artist = track.ArtistName
+		album = track.AlbumTitle
+		durationMs = track.DurationMs
+	}
 
 	var candidates []candidate
 
@@ -937,10 +976,10 @@ func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac avail
 			// user pick; the title/artist/negative filters below are auto-download
 			// guards that must not silently drop results in the manual flow.
 			if !cfg.includeAll {
-				if !strings.Contains(nameLower, titleLower) {
+				if !matching.MatchTitleInPath(f.Filename, title) {
 					continue
 				}
-				if cfg.requireArtist && !strings.Contains(nameLower, artistLower) {
+				if cfg.requireArtist && !matching.MatchArtistInPath(f.Filename, artist) {
 					continue
 				}
 				if cfg.excludeNegative && matchesNegativeKeyword(nameLower, cfg.negativeKeywords) {
@@ -971,9 +1010,34 @@ func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac avail
 				continue
 			}
 			score := qualityScore
+			if losslessExts[ext] {
+				score += losslessQualityBonus(nameLower, f)
+			}
 			// Keep artist bonus below the tier gap (25) so quality always dominates.
-			if artistLower != "" && strings.Contains(nameLower, artistLower) {
+			if artist != "" && matching.MatchArtistInPath(f.Filename, artist) {
 				score += 20
+			}
+			if !cfg.includeAll {
+				if album != "" && matching.MatchAlbumInPath(f.Filename, album) {
+					score += 8
+				}
+				if durationMs > 0 && f.Length > 0 {
+					targetSec := durationMs / 1000
+					diff := f.Length - targetSec
+					if diff < 0 {
+						diff = -diff
+					}
+					if diff <= 5 {
+						score += 5
+					} else if diff > 45 && float64(diff) > 0.35*float64(targetSec) {
+						score -= 30
+					}
+				}
+				if mismatch, hardReject := matching.HasUnrequestedVariant(f.Filename, title); hardReject {
+					score -= 50
+				} else if mismatch {
+					score -= 35
+				}
 			}
 			freeSlotBonus := 0
 			if result.HasFreeUploadSlot {
@@ -992,10 +1056,42 @@ func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac avail
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		if candidates[i].file.BitDepth != candidates[j].file.BitDepth {
+			return candidates[i].file.BitDepth > candidates[j].file.BitDepth
+		}
+		if candidates[i].file.SampleRate != candidates[j].file.SampleRate {
+			return candidates[i].file.SampleRate > candidates[j].file.SampleRate
+		}
+		return candidates[i].file.Size > candidates[j].file.Size
 	})
 
 	return candidates
+}
+
+func losslessQualityBonus(nameLower string, f slskd.SearchFile) int {
+	switch {
+	case f.BitDepth >= 24 && f.SampleRate >= 176400:
+		return 45
+	case f.BitDepth >= 24 && f.SampleRate >= 88200:
+		return 35
+	case f.BitDepth >= 24:
+		return 25
+	case f.SampleRate >= 48000:
+		return 10
+	}
+	if f.BitDepth == 0 {
+		if strings.Contains(nameLower, "24-192") || strings.Contains(nameLower, "24bit 192") || strings.Contains(nameLower, "24-bit 192") {
+			return 40
+		}
+		if strings.Contains(nameLower, "24-96") || strings.Contains(nameLower, "24bit 96") || strings.Contains(nameLower, "24-bit 96") ||
+			strings.Contains(nameLower, "24bit") || strings.Contains(nameLower, "24-bit") || strings.Contains(nameLower, "hires") || strings.Contains(nameLower, "hi-res") {
+			return 25
+		}
+	}
+	return 0
 }
 
 // QualityTierRank returns the rank of a format/bitrate in the given tiers.

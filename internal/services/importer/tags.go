@@ -13,9 +13,10 @@ import (
 
 // fileMeta is everything import needs from one music file.
 type fileMeta struct {
-	Path       string
-	Artist     string // album artist when tagged, falling back to track artist
-	Album      string
+	Path           string
+	Artist         string // album artist when tagged, falling back to track artist
+	HasAlbumArtist bool
+	Album          string
 	Title      string
 	Track      int
 	Disc       int
@@ -57,6 +58,7 @@ func readMP3(path string) (*fileMeta, error) {
 
 	artist := strings.TrimSpace(tag.Artist())
 	albumArtist := strings.TrimSpace(tag.GetTextFrame("TPE2").Text)
+	m.HasAlbumArtist = albumArtist != ""
 	m.Artist = firstNonEmpty(albumArtist, artist)
 
 	m.Track, _ = parseSlashNumber(tag.GetTextFrame("TRCK").Text)
@@ -147,6 +149,7 @@ func readFLAC(path string) (*fileMeta, error) {
 			}
 		}
 	}
+	m.HasAlbumArtist = albumArtist != ""
 	m.Artist = firstNonEmpty(albumArtist, artist)
 
 	if si, err := f.GetStreamInfo(); err == nil && si.SampleRate > 0 {

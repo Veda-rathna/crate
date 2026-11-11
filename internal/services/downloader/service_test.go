@@ -956,6 +956,10 @@ func (f *fakeArcodProvider) FindBestTrack(ctx context.Context, artistName, track
 	return f.bestTrack, nil
 }
 
+func (f *fakeArcodProvider) FindBestTrackMatch(ctx context.Context, q arcod.MatchQuery) (*arcod.TrackItem, error) {
+	return f.FindBestTrack(ctx, q.Artist, q.Title)
+}
+
 func (f *fakeArcodProvider) DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error) {
 	if f.downloadErr != nil {
 		return 0, f.downloadErr
@@ -986,5 +990,125 @@ func TestSanitizeFilename(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("sanitizeFilename(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestScoreCandidatesRelaxedMatching(t *testing.T) {
+	cfg := scoringConfig{
+		tiers:           []models.QualityTier{{Format: "flac", Label: "FLAC"}},
+		fallbackEnabled: false,
+	}
+
+	results := []slskd.SearchResult{
+		{
+			Username:          "peer1",
+			HasFreeUploadSlot: true,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Beyonce/Lemonade/02 - Dont Hurt Yourself.flac", Size: 30000000, BitDepth: 24, SampleRate: 48000},
+				{Filename: "Music/AR Rahman/Roja/01 - Chinna Chinna Aasai.flac", Size: 30000000},
+				{Filename: "Music/SomeoneElse/01 - Everyone.flac", Size: 30000000},
+			},
+		},
+	}
+
+	t1 := &models.Track{Title: "Don't Hurt Yourself (Explicit)", ArtistName: "Beyoncé", AlbumTitle: "Lemonade"}
+	if best := pickBestFile(results, t1, nil, cfg); best == nil || !strings.Contains(best.file.Filename, "Dont Hurt Yourself") {
+		t.Errorf("expected relaxed diacritic/apostrophe/edition match, got %+v", best)
+	}
+
+	t2 := &models.Track{Title: "Chinna Chinna Aasai", ArtistName: "A.R. Rahman", AlbumTitle: "Roja"}
+	if best := pickBestFile(results, t2, nil, cfg); best == nil || !strings.Contains(best.file.Filename, "Chinna Chinna Aasai") {
+		t.Errorf("expected relaxed initialism match for A.R. Rahman, got %+v", best)
+	}
+
+	// Short title "One" must not false-match "Everyone"
+	t3 := &models.Track{Title: "One", ArtistName: "SomeoneElse"}
+	if best := pickBestFile(results, t3, nil, cfg); best != nil {
+		t.Errorf("expected nil (One must not match Everyone), got %s", best.file.Filename)
+	}
+}
+
+func TestScoreCandidatesPrefersHighestFLACAndAlbum(t *testing.T) {
+	cfg := scoringConfig{
+		tiers:           []models.QualityTier{{Format: "flac", Label: "FLAC"}},
+		fallbackEnabled: false,
+	}
+
+	results := []slskd.SearchResult{
+		{
+			Username:          "user_16bit_free",
+			HasFreeUploadSlot: true,
+			QueueLength:       0,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Pink Floyd/The Dark Side of the Moon/04 - Time.flac", Size: 30000000, BitDepth: 16, SampleRate: 44100, Length: 420},
+			},
+		},
+		{
+			Username:          "user_24_192_live_free",
+			HasFreeUploadSlot: true,
+			QueueLength:       0,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Pink Floyd/Pulse/04 - Time (Live).flac", Size: 90000000, BitDepth: 24, SampleRate: 192000, Length: 420},
+			},
+		},
+		{
+			Username:          "user_24_96_studio",
+			HasFreeUploadSlot: false,
+			QueueLength:       1,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Pink Floyd/Other/04 - Time.flac", Size: 65000000, BitDepth: 24, SampleRate: 96000, Length: 420},
+			},
+		},
+		{
+			Username:          "user_24_192_studio",
+			HasFreeUploadSlot: false,
+			QueueLength:       2,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Pink Floyd/The Dark Side of the Moon/04 - Time.flac", Size: 95000000, BitDepth: 24, SampleRate: 192000, Length: 420},
+			},
+		},
+	}
+
+	track := &models.Track{
+		Title:      "Time",
+		ArtistName: "Pink Floyd",
+		AlbumTitle: "The Dark Side of the Moon",
+		DurationMs: 420000,
+	}
+
+	best := pickBestFile(results, track, nil, cfg)
+	if best == nil {
+		t.Fatal("expected a candidate")
+	}
+	if best.username != "user_24_192_studio" {
+		t.Errorf("expected 24-bit/192kHz studio FLAC (user_24_192_studio), got %s (%s)", best.username, best.file.Filename)
+	}
+}
+
+func TestScoreCandidatesTieBreaksByBitDepthSampleRateSize(t *testing.T) {
+	cfg := scoringConfig{
+		tiers:           []models.QualityTier{{Format: "flac", Label: "FLAC"}},
+		fallbackEnabled: false,
+	}
+	results := []slskd.SearchResult{
+		{
+			Username:          "smaller",
+			HasFreeUploadSlot: true,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Artist/Album/Track.flac", Size: 20000000, BitDepth: 16, SampleRate: 44100},
+			},
+		},
+		{
+			Username:          "larger",
+			HasFreeUploadSlot: true,
+			Files: []slskd.SearchFile{
+				{Filename: "Music/Artist/Album/Track.flac", Size: 35000000, BitDepth: 16, SampleRate: 44100},
+			},
+		},
+	}
+	track := &models.Track{Title: "Track", ArtistName: "Artist", AlbumTitle: "Album"}
+	best := pickBestFile(results, track, nil, cfg)
+	if best == nil || best.username != "larger" {
+		t.Errorf("expected tie-break to larger size, got %+v", best)
 	}
 }

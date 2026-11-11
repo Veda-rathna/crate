@@ -25,6 +25,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/library"
+	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 )
@@ -178,18 +179,31 @@ func (s *Service) scan(root string, dryRun bool) (*Report, error) {
 			continue
 		}
 
-		aKey := strings.ToLower(meta.Artist)
+		groupArtist := meta.Artist
+		if !meta.HasAlbumArtist {
+			groupArtist = matching.PrimaryArtist(meta.Artist)
+		}
+		aKey := matching.Normalize(groupArtist)
+		if aKey == "" {
+			aKey = strings.ToLower(strings.TrimSpace(groupArtist))
+		}
 		ag, ok := artists[aKey]
 		if !ok {
-			ag = &artistGroup{name: meta.Artist, mbIDs: make(map[string]bool), albums: make(map[string]*albumGroup)}
+			ag = &artistGroup{name: groupArtist, mbIDs: make(map[string]bool), albums: make(map[string]*albumGroup)}
 			artists[aKey] = ag
+		} else if meta.HasAlbumArtist && len(groupArtist) < len(ag.name) {
+			ag.name = groupArtist
 		}
 		ag.mbIDs[meta.MBArtistID] = true
 
-		alKey := strings.ToLower(meta.Album)
+		cleanAlbum := matching.StripDiscSuffix(meta.Album)
+		if cleanAlbum == "" {
+			cleanAlbum = meta.Album
+		}
+		alKey := matching.NormalizeAlbumGroupKey(meta.Album)
 		alg, ok := ag.albums[alKey]
 		if !ok {
-			alg = &albumGroup{title: meta.Album, years: make(map[int]int), rgIDs: make(map[string]bool)}
+			alg = &albumGroup{title: cleanAlbum, years: make(map[int]int), rgIDs: make(map[string]bool)}
 			ag.albums[alKey] = alg
 		}
 		if meta.Year > 0 {
@@ -221,10 +235,20 @@ func (s *Service) persistArtist(g *artistGroup, dryRun bool, report *Report) err
 	}
 
 	// Reuse an existing artist row — by provider identity first, then by
-	// name so imports attach to artists the user already watches.
+	// name (exact fold, then relaxed) so imports attach to watched artists.
 	artist, _ := s.queries.FindArtistByProvider(prov, pid)
 	if artist == nil {
 		artist, _ = s.queries.FindArtistByNameFold(g.name)
+	}
+	if artist == nil {
+		if all, err := s.queries.ListArtists(); err == nil {
+			for i := range all {
+				if matching.ArtistsMatch(g.name, all[i].Name) {
+					artist = &all[i]
+					break
+				}
+			}
+		}
 	}
 	if artist == nil {
 		report.ArtistsAdded++
@@ -261,6 +285,25 @@ func (s *Service) persistAlbum(artist *models.Artist, g *albumGroup, dryRun bool
 		album, _ = s.queries.FindAlbumByProvider(prov, pid)
 		if album == nil && artist.ID > 0 {
 			album, _ = s.queries.FindAlbumByArtistTitleFold(artist.ID, g.title)
+		}
+		if album == nil && artist.ID > 0 {
+			if existing, err := s.queries.ListAlbumsByArtist(artist.ID); err == nil {
+				yr := commonYear(g.years)
+				for i := range existing {
+					a := &existing[i]
+					if yr != nil && a.Year != nil && *yr != *a.Year {
+						continue
+					}
+					if matching.TitlesMatch(g.title, a.Title) {
+						m1, _ := matching.HasUnrequestedVariant(g.title, a.Title)
+						m2, _ := matching.HasUnrequestedVariant(a.Title, g.title)
+						if !m1 && !m2 {
+							album = a
+							break
+						}
+					}
+				}
+			}
 		}
 	}
 	if album == nil {
@@ -311,6 +354,31 @@ func (s *Service) persistTrack(artist *models.Artist, album *models.Album, f *fi
 	}
 	if track == nil && album.ID > 0 {
 		track, _ = s.queries.FindTrackByAlbumTitleFold(album.ID, f.Title)
+	}
+	if track == nil && album.ID > 0 {
+		if existing, err := s.queries.ListTracksByAlbum(album.ID); err == nil {
+			bestQ := 0
+			for i := range existing {
+				t := &existing[i]
+				q := matching.TitleMatchQuality(f.Title, t.Title)
+				if q == 0 {
+					continue
+				}
+				m1, _ := matching.HasUnrequestedVariant(f.Title, t.Title)
+				m2, _ := matching.HasUnrequestedVariant(t.Title, f.Title)
+				if m1 || m2 {
+					continue
+				}
+				if f.Track > 0 && t.TrackNumber == f.Track && (f.Disc == 0 || t.DiscNumber == f.Disc) {
+					track = t
+					break
+				}
+				if q > bestQ {
+					bestQ = q
+					track = t
+				}
+			}
+		}
 	}
 
 	storedPath := f.Path

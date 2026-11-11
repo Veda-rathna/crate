@@ -32,7 +32,11 @@ func (s *Service) Organize(track *models.Track) error {
 		return fmt.Errorf("organizer: track %d has no file_path", track.ID)
 	}
 	srcBase := filepath.Base(*track.FilePath)
-	src, err := findFile(s.downloadsDir, srcBase)
+	hint := ""
+	if track.DownloadedFilename != nil {
+		hint = *track.DownloadedFilename
+	}
+	src, err := findFileWithHint(s.downloadsDir, srcBase, hint)
 	if err != nil {
 		return fmt.Errorf("organizer: %w", err)
 	}
@@ -101,14 +105,28 @@ func (s *Service) Organize(track *models.Track) error {
 	if album.CoverURL != nil {
 		coverURL = *album.CoverURL
 	}
+	discNum := track.DiscNumber
+	if discNum <= 0 {
+		discNum = 1
+	}
+	var mbAlbumArtist, mbReleaseGroup string
+	if album.Provider == "musicbrainz" {
+		mbReleaseGroup = album.ProviderID
+	}
+	if artist.Provider == "musicbrainz" {
+		mbAlbumArtist = artist.ProviderID
+	}
 	if err := tagger.Tag(dest, tagger.TrackMeta{
-		Title:       track.Title,
-		Artist:      artist.Name,
-		Album:       album.Title,
-		TrackNumber: track.TrackNumber,
-		DiscNumber:  track.DiscNumber,
-		Year:        year,
-		CoverURL:    coverURL,
+		Title:          track.Title,
+		Artist:         artist.Name,
+		AlbumArtist:    artist.Name,
+		Album:          album.Title,
+		TrackNumber:    track.TrackNumber,
+		DiscNumber:     discNum,
+		Year:           year,
+		CoverURL:       coverURL,
+		MBAlbumArtist:  mbAlbumArtist,
+		MBReleaseGroup: mbReleaseGroup,
 	}); err != nil {
 		slog.Warn("organizer: tagging failed", "dest", dest, "error", err)
 	}
@@ -165,21 +183,41 @@ func pruneEmptyDirs(dir, root string) {
 }
 
 func findFile(root, name string) (string, error) {
-	var found string
+	return findFileWithHint(root, name, "")
+}
+
+func findFileWithHint(root, name, hint string) (string, error) {
+	var matches []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		if filepath.Base(path) == name {
-			found = path
-			return filepath.SkipAll
+			matches = append(matches, path)
 		}
 		return nil
 	})
-	if found == "" {
+	if len(matches) == 0 {
 		return "", fmt.Errorf("not found: %s", name)
 	}
-	return found, err
+	if len(matches) == 1 || strings.TrimSpace(hint) == "" {
+		return matches[0], err
+	}
+
+	// Prefer the match whose trailing parent directory matches the remote
+	// downloaded filename hint (e.g. avoids cross-wiring two "01 - Intro.flac" files).
+	normHint := strings.ToLower(strings.ReplaceAll(hint, `\`, "/"))
+	hintDir := filepath.ToSlash(filepath.Dir(normHint))
+	if hintDir != "." && hintDir != "/" {
+		hintSeg := strings.ToLower(filepath.Base(hintDir))
+		for _, m := range matches {
+			mDir := strings.ToLower(filepath.Base(filepath.Dir(m)))
+			if mDir == hintSeg {
+				return m, err
+			}
+		}
+	}
+	return matches[0], err
 }
 
 func copyFile(src, dst string) error {

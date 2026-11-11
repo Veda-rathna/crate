@@ -484,3 +484,193 @@ func TestTagDispatch(t *testing.T) {
 		t.Error("Tag(.flac) should write the TITLE vorbis field")
 	}
 }
+
+func TestTagFLAC_UnifiesAlbumAndStripsConflictingAlbumTags(t *testing.T) {
+	dir := t.TempDir()
+	track1Path := filepath.Join(dir, "01.flac")
+	track2Path := filepath.Join(dir, "02.flac")
+	if err := os.WriteFile(track1Path, makeMinimalFLAC(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(track2Path, makeMinimalFLAC(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate Track 1 from an album release and Track 2 from a compilation/single
+	// with conflicting album-grouping tags alongside ReplayGain and recording ID.
+	seedTags := func(path string, extra map[string]string) {
+		f, err := flac.ParseFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmt := flacvorbis.New()
+		for k, v := range extra {
+			cmt.Add(k, v)
+		}
+		block := cmt.Marshal()
+		f.Meta = append(f.Meta, &block)
+		if err := f.Save(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedTags(track1Path, map[string]string{
+		"ALBUMARTIST":                "Main Artist",
+		"MUSICBRAINZ_ALBUMID":        "release-1",
+		"MUSICBRAINZ_RELEASEGROUPID": "rg-old-1",
+		"REPLAYGAIN_TRACK_GAIN":      "-4.10 dB",
+		"MUSICBRAINZ_TRACKID":        "rec-uuid-1",
+	})
+	seedTags(track2Path, map[string]string{
+		"ALBUMARTIST":                "Main Artist & Guest",
+		"ALBUM ARTIST":               "Various Artists",
+		"COMPILATION":                "1",
+		"ALBUMSORT":                  "Single Version",
+		"DISCSUBTITLE":               "Bonus Disc",
+		"TOTALDISCS":                 "2",
+		"YEAR":                       "2019",
+		"MUSICBRAINZ_ALBUMID":        "release-2",
+		"MUSICBRAINZ_RELEASEGROUPID": "rg-old-2",
+		"REPLAYGAIN_TRACK_GAIN":      "-6.20 dB",
+		"MUSICBRAINZ_TRACKID":        "rec-uuid-2",
+	})
+
+	for idx, p := range []string{track1Path, track2Path} {
+		err := Tag(p, TrackMeta{
+			Title:          "Song",
+			Artist:         "Main Artist",
+			AlbumArtist:    "Main Artist",
+			Album:          "Unified Album",
+			TrackNumber:    idx + 1,
+			DiscNumber:     1,
+			Year:           2023,
+			MBAlbumArtist:  "artist-mbid",
+			MBReleaseGroup: "rg-canonical",
+		})
+		if err != nil {
+			t.Fatalf("Tag(%s): %v", p, err)
+		}
+	}
+
+	readComments := func(path string) *flacvorbis.MetaDataBlockVorbisComment {
+		f, err := flac.ParseFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, block := range f.Meta {
+			if block.Type == flac.VorbisComment {
+				cmt, err := flacvorbis.ParseFromMetaDataBlock(*block)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return cmt
+			}
+		}
+		t.Fatal("missing vorbis comment block")
+		return nil
+	}
+
+	for i, p := range []string{track1Path, track2Path} {
+		cmt := readComments(p)
+		get := func(k string) []string {
+			v, _ := cmt.Get(k)
+			return v
+		}
+		if v := get("ALBUMARTIST"); len(v) != 1 || v[0] != "Main Artist" {
+			t.Errorf("track %d ALBUMARTIST = %v, want [Main Artist]", i+1, v)
+		}
+		if v := get("ALBUM"); len(v) != 1 || v[0] != "Unified Album" {
+			t.Errorf("track %d ALBUM = %v, want [Unified Album]", i+1, v)
+		}
+		if v := get("MUSICBRAINZ_RELEASEGROUPID"); len(v) != 1 || v[0] != "rg-canonical" {
+			t.Errorf("track %d MUSICBRAINZ_RELEASEGROUPID = %v, want [rg-canonical]", i+1, v)
+		}
+		for _, forbidden := range []string{"ALBUM ARTIST", "COMPILATION", "ALBUMSORT", "DISCSUBTITLE", "TOTALDISCS", "YEAR", "MUSICBRAINZ_ALBUMID"} {
+			if v := get(forbidden); len(v) != 0 {
+				t.Errorf("track %d expected %s stripped, got %v", i+1, forbidden, v)
+			}
+		}
+	}
+
+	if v, _ := readComments(track1Path).Get("MUSICBRAINZ_TRACKID"); len(v) != 1 || v[0] != "rec-uuid-1" {
+		t.Errorf("track 1 recording id lost: %v", v)
+	}
+	if v, _ := readComments(track2Path).Get("REPLAYGAIN_TRACK_GAIN"); len(v) != 1 || v[0] != "-6.20 dB" {
+		t.Errorf("track 2 replaygain lost: %v", v)
+	}
+}
+
+func TestTagMP3_UnifiesAlbumAndStripsConflictingFrames(t *testing.T) {
+	dir := t.TempDir()
+	mp3Path := filepath.Join(dir, "test.mp3")
+	if err := os.WriteFile(mp3Path, makeMinimalMP3(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	seed, err := id3v2.Open(mp3Path, id3v2.Options{Parse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.AddTextFrame("TPE2", id3v2.EncodingUTF8, "Various Artists")
+	seed.AddTextFrame("TCMP", id3v2.EncodingUTF8, "1")
+	seed.AddTextFrame("TSOA", id3v2.EncodingUTF8, "Wrong Sort")
+	seed.AddTextFrame("TSRC", id3v2.EncodingUTF8, "USRC17607839")
+	seed.AddUserDefinedTextFrame(id3v2.UserDefinedTextFrame{
+		Encoding: id3v2.EncodingUTF8, Description: "MusicBrainz Album Id", Value: "wrong-release-id",
+	})
+	seed.AddUserDefinedTextFrame(id3v2.UserDefinedTextFrame{
+		Encoding: id3v2.EncodingUTF8, Description: "Acoustid Id", Value: "acoustid-keep",
+	})
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	err = Tag(mp3Path, TrackMeta{
+		Title:       "Song",
+		Artist:      "Main Artist",
+		AlbumArtist: "Main Artist",
+		Album:       "Unified Album",
+		TrackNumber: 1,
+		DiscNumber:  1,
+		Year:        2024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tag, err := id3v2.Open(mp3Path, id3v2.Options{Parse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tag.Close()
+
+	if got := tag.GetTextFrame("TPE2").Text; got != "Main Artist" {
+		t.Errorf("TPE2 = %q, want Main Artist", got)
+	}
+	if got := tag.GetTextFrame("TCMP").Text; got != "" {
+		t.Errorf("TCMP should be stripped, got %q", got)
+	}
+	if got := tag.GetTextFrame("TSOA").Text; got != "" {
+		t.Errorf("TSOA should be stripped, got %q", got)
+	}
+	if got := tag.GetTextFrame("TSRC").Text; got != "USRC17607839" {
+		t.Errorf("TSRC should be preserved, got %q", got)
+	}
+	var hasAcoustID, hasWrongAlbumID bool
+	for _, f := range tag.GetFrames("TXXX") {
+		if udf, ok := f.(id3v2.UserDefinedTextFrame); ok {
+			if udf.Description == "Acoustid Id" && udf.Value == "acoustid-keep" {
+				hasAcoustID = true
+			}
+			if udf.Description == "MusicBrainz Album Id" {
+				hasWrongAlbumID = true
+			}
+		}
+	}
+	if !hasAcoustID {
+		t.Error("expected Acoustid Id TXXX frame to be preserved")
+	}
+	if hasWrongAlbumID {
+		t.Error("expected conflicting MusicBrainz Album Id TXXX frame to be stripped")
+	}
+}

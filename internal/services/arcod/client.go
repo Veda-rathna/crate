@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 )
 
 const (
@@ -38,7 +39,16 @@ type TrackItem struct {
 	Hires               bool    `json:"hires"`
 	Streamable          bool    `json:"streamable"`
 	Artist              string  `json:"artist"`
+	AlbumArtist         string  `json:"album_artist,omitempty"`
 	Album               string  `json:"album"`
+}
+
+// MatchQuery describes the target track metadata for relaxed Arcod matching.
+type MatchQuery struct {
+	Artist     string
+	Title      string
+	Album      string
+	DurationMs int
 }
 
 type SearchResponse struct {
@@ -317,6 +327,7 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 			Hires:               raw.Hires || raw.HiresStreamable,
 			Streamable:          raw.Streamable,
 			Artist:              artist,
+			AlbumArtist:         raw.Album.Artist.Name,
 			Album:               raw.Album.Title,
 		})
 	}
@@ -354,19 +365,66 @@ func cleanString(s string) string {
 }
 
 // FindBestTrack searches arcod for a track matching artist and title.
-// Returns the highest quality match (prefers Hi-Res FLAC), or nil if no good match found.
+// Returns the highest quality FLAC match, or nil if no good match is found.
 func (c *Client) FindBestTrack(ctx context.Context, artistName, trackTitle string) (*TrackItem, error) {
-	cleanArtist := cleanString(artistName)
-	cleanTitle := cleanString(trackTitle)
+	return c.FindBestTrackMatch(ctx, MatchQuery{
+		Artist: artistName,
+		Title:  trackTitle,
+	})
+}
 
-	query := fmt.Sprintf("%s %s", artistName, trackTitle)
-	results, err := c.Search(ctx, query)
-	if err != nil {
-		return nil, err
+// FindBestTrackMatch searches arcod using relaxed metadata matching (preferring
+// studio versions, matching album/duration, and selecting the highest FLAC
+// bit-depth and sample-rate available).
+func (c *Client) FindBestTrackMatch(ctx context.Context, q MatchQuery) (*TrackItem, error) {
+	queries := buildSearchQueries(q)
+	for _, query := range queries {
+		results, err := c.Search(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		if best := pickBestMatch(results, q); best != nil {
+			return best, nil
+		}
+	}
+	return nil, nil
+}
+
+func buildSearchQueries(q MatchQuery) []string {
+	var queries []string
+	seen := make(map[string]bool)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[strings.ToLower(s)] {
+			return
+		}
+		seen[strings.ToLower(s)] = true
+		queries = append(queries, s)
 	}
 
+	add(matching.CleanSearchQuery(q.Artist, q.Title))
+
+	primaryArtist := matching.PrimaryArtist(q.Artist)
+	coreTitle := matching.StripQualifiers(q.Title)
+	for _, sep := range []string{" - ", " – ", " — ", ": "} {
+		if lead, _, ok := strings.Cut(coreTitle, sep); ok && strings.TrimSpace(lead) != "" {
+			add(matching.CleanSearchQuery(primaryArtist, lead))
+		}
+	}
+
+	if norm := matching.Normalize(primaryArtist + " " + coreTitle); norm != "" {
+		add(norm)
+	}
+
+	return queries
+}
+
+func pickBestMatch(results []TrackItem, q MatchQuery) *TrackItem {
 	var best *TrackItem
 	bestScore := -1
+
+	targetContext := strings.TrimSpace(q.Title + " " + q.Album)
+	targetSec := q.DurationMs / 1000
 
 	for i := range results {
 		t := &results[i]
@@ -374,48 +432,80 @@ func (c *Client) FindBestTrack(ctx context.Context, artistName, trackTitle strin
 			continue
 		}
 
-		itemArtist := cleanString(t.Artist)
-		itemTitle := cleanString(t.Title)
-
-		// Check artist match
-		artistMatches := itemArtist == cleanArtist ||
-			strings.Contains(itemArtist, cleanArtist) ||
-			strings.Contains(cleanArtist, itemArtist)
-
+		// Artist check against performer OR album artist (soundtracks/features).
+		artistMatches := matching.ArtistsMatch(q.Artist, t.Artist) ||
+			(t.AlbumArtist != "" && matching.ArtistsMatch(q.Artist, t.AlbumArtist))
 		if !artistMatches {
 			continue
 		}
 
-		// Check title match
-		titleMatches := itemTitle == cleanTitle ||
-			strings.HasPrefix(itemTitle, cleanTitle) ||
-			strings.HasPrefix(cleanTitle, itemTitle)
+		fullTitle := strings.TrimSpace(t.Title)
+		if t.Version != "" && !strings.Contains(strings.ToLower(fullTitle), strings.ToLower(t.Version)) {
+			fullTitle = strings.TrimSpace(fullTitle + " (" + t.Version + ")")
+		}
 
-		if !titleMatches {
+		titleQuality := matching.TitleMatchQuality(q.Title, fullTitle)
+		if t.Title != fullTitle {
+			if q2 := matching.TitleMatchQuality(q.Title, t.Title); q2 > titleQuality {
+				titleQuality = q2
+			}
+		}
+		if titleQuality == 0 {
 			continue
 		}
 
-		// Score: Prefer FLAC bit depth and sample rate
-		score := 50
-		if t.MaximumBitDepth >= 24 {
+		// Reject unrequested musical variants (live, remix, karaoke, instrumental, cover, etc.)
+		// so studio tracks aren't mis-matched to live/cover versions and can fall back cleanly.
+		if mismatch, hardReject := matching.HasUnrequestedVariant(fullTitle, q.Title); mismatch || hardReject {
+			continue
+		}
+		if t.Album != "" {
+			if mismatch, hardReject := matching.HasUnrequestedVariant(t.Album, targetContext); mismatch || hardReject {
+				continue
+			}
+		}
+
+		// Score by exact FLAC bit depth & sample rate so highest FLAC always wins.
+		bitDepth := t.MaximumBitDepth
+		if bitDepth <= 0 {
+			bitDepth = 16
+		}
+		sampleTenths := int(t.MaximumSamplingRate*10 + 0.5)
+		if sampleTenths <= 0 {
+			sampleTenths = 441
+		}
+		score := bitDepth*1000 + sampleTenths + titleQuality*30
+
+		if q.Album != "" && t.Album != "" && matching.TitlesMatch(q.Album, t.Album) {
+			score += 500
+		}
+
+		if t.AlbumArtist != "" && matching.ArtistsMatch(q.Artist, t.AlbumArtist) {
 			score += 50
-		} else if t.MaximumBitDepth >= 16 {
-			score += 30
 		}
 
-		if t.MaximumSamplingRate >= 96.0 {
-			score += 15
-		} else if t.MaximumSamplingRate >= 44.1 {
-			score += 10
+		if targetSec > 0 && t.Duration > 0 {
+			diff := t.Duration - targetSec
+			if diff < 0 {
+				diff = -diff
+			}
+			switch {
+			case diff <= 5:
+				score += 1000
+			case diff <= 15:
+				score += 400
+			case diff > 45 && float64(diff) > 0.35*float64(targetSec):
+				score -= 20000
+			}
 		}
 
-		if score > bestScore {
+		if best == nil || score > bestScore {
 			bestScore = score
 			best = t
 		}
 	}
 
-	return best, nil
+	return best
 }
 
 // GetStreamURL retrieves the temporary audio stream URL for a track.
@@ -483,11 +573,31 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (
 	return res.URL, nil
 }
 
-// DownloadTrack downloads the lossless FLAC audio directly into destPath.
+// DownloadTrack downloads the highest available lossless FLAC audio into destPath.
+// When requesting DefaultQuality (27 = 24-bit/192kHz), it falls back only to lower
+// lossless FLAC tiers (7 = 24-bit/96kHz, 6 = 16-bit/44.1kHz), never lossy formats.
 func (c *Client) DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error) {
-	streamURL, err := c.GetStreamURL(ctx, trackID, quality)
-	if err != nil {
-		return 0, fmt.Errorf("get stream url: %w", err)
+	qualities := []int{quality}
+	if quality <= 0 || quality == DefaultQuality {
+		qualities = []int{DefaultQuality, 7, 6}
+	}
+
+	var streamURL string
+	var lastErr error
+	for _, q := range qualities {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		u, err := c.GetStreamURL(ctx, trackID, q)
+		if err == nil {
+			streamURL = u
+			break
+		}
+		lastErr = err
+		slog.Debug("arcod: stream quality unavailable, trying next FLAC tier", "track_id", trackID, "quality", q, "error", err)
+	}
+	if streamURL == "" {
+		return 0, fmt.Errorf("get stream url: %w", lastErr)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
@@ -530,15 +640,16 @@ func (c *Client) DownloadTrack(ctx context.Context, trackID int64, quality int, 
 		return 0, fmt.Errorf("downloaded file too small (%d bytes)", n)
 	}
 
-	// Verify FLAC magic header
+	// Verify FLAC magic header so lossy/error payloads are never saved as .flac.
 	header := make([]byte, 4)
 	rf, err := os.Open(tmpFile)
-	if err == nil {
-		_, _ = io.ReadFull(rf, header)
-		_ = rf.Close()
-		if string(header) != "fLaC" {
-			slog.Warn("arcod: downloaded file header is not fLaC", "header", string(header))
-		}
+	if err != nil {
+		return 0, fmt.Errorf("verify flac header: %w", err)
+	}
+	_, readErr := io.ReadFull(rf, header)
+	_ = rf.Close()
+	if readErr != nil || string(header) != "fLaC" {
+		return 0, fmt.Errorf("arcod: downloaded file is not valid FLAC (header %q)", string(header))
 	}
 
 	if err := os.Rename(tmpFile, destPath); err != nil {

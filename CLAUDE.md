@@ -17,6 +17,7 @@ internal/
   db/                           SQLite via modernc.org/sqlite, goose migrations, raw SQL queries
   migrations/                   Embedded .sql migration files
   library/                      Shared track-path helpers (ResolvePath, Contains) — all file_path resolution goes through here
+  matching/                     Relaxed, diacritic/punctuation-tolerant metadata matching and variant detection
   models/                       Shared structs and status enums
   naming/                       Library path templates: parse/validate/render ({artist}/{album}/...)
   provider/
@@ -104,8 +105,8 @@ Frontend polls every 2s, shows results as they arrive with a spinner until `is_c
 
 All file selection goes through `scoreCandidates()` in `internal/services/downloader/service.go`. Score components:
 
-- **Quality (0-100)**: tier-based from user's priority list. Tier 0 = 100, Tier 1 = 75, Tier 2 = 50, etc. (min 25, gap of 25 per tier). If no tiers configured, uses fallback scoring. Fallback scores are capped below the lowest tier.
-- **Artist matching**: auto-downloads require both artist name and title in the file path — no fallback. Manual search applies **no** content filter and returns every slskd result for the user to pick (artist is only a +20 ranking bonus). See [ADR-0001](docs/adr/0001-artist-matching-fallback.md) and [ADR-0003](docs/adr/0003-manual-search-no-filter.md).
+- **Quality (0-100)**: tier-based from user's priority list. Tier 0 = 100, Tier 1 = 75, Tier 2 = 50, etc. (min 25, gap of 25 per tier). If no tiers configured, uses fallback scoring. Fallback scores are capped below the lowest tier. Lossless files also receive Hi-Res bit-depth/sample-rate bonuses (24-bit/192kHz > 24-bit/96kHz > 24-bit > 48kHz > 16-bit/44.1kHz) and tie-break by bit depth, sample rate, and file size.
+- **Artist & title matching**: auto-downloads use relaxed token-boundary matching (`internal/matching`) across diacritics, apostrophes, punctuation, initialisms, and stripped edition/soundtrack qualifiers while penalizing unrequested variants (live, remix, instrumental, karaoke, etc.) and duration mismatches — preferring candidates from the matching album directory. Manual search applies **no** content filter and returns every slskd result for the user to pick (artist is only a +20 ranking bonus). See [ADR-0001](docs/adr/0001-artist-matching-fallback.md) and [ADR-0003](docs/adr/0003-manual-search-no-filter.md).
 - **Artist bonus (+20)**: in manual search results, artist name in filename adds +20. Kept below the tier gap (25) so quality always dominates between tiers.
 - **Free slot bonus (+10)**: if user has a free upload slot (instant start).
 - **Queue score (0-15)**: `15 / (1 + queueLength)`. Empty queue = 15, decays toward 0.
@@ -117,7 +118,7 @@ Design invariants (enforced by `TestScoringBalance`):
 - All bonuses combined (max 45) can overcome one tier gap but not two (50)
 - Fallback formats lose to configured tiers at equal availability
 
-The `quality_fallback_enabled` setting (default true) controls whether files outside configured tiers are accepted at all.
+The `quality_fallback_enabled` setting (default `false` since migration `012_prefer_highest_flac.sql`) controls whether files outside configured tiers are accepted at all.
 
 **Negative keywords**: user-configurable list stored as JSON array in the `negative_keywords` setting (e.g. `["acapella", "instrumental"]`). Auto-downloads skip files whose filename matches any keyword. Manual search still returns them but marks `negative_match: true` so the UI can dim them. Case-insensitive matching against the lowercased filename.
 
@@ -139,7 +140,7 @@ Artists can be restricted to download music only in specific languages (e.g., Ta
 
 ## Quality Upgrades
 
-- Priority-ordered quality tiers stored as JSON in settings (`quality_tiers`), default: FLAC > MP3 320 > MP3 256
+- Priority-ordered quality tiers stored as JSON in settings (`quality_tiers`), default: FLAC only (`012_prefer_highest_flac.sql`)
 - `download_format` and `download_bitrate` recorded on tracks at search time (when the slskd result is picked)
 - Scheduler scans one artist per day (round-robin via `upgrade_last_artist_id` setting), re-queues owned tracks that can be upgraded to a higher-priority tier
 - `QualityTierRank()` and `IsUpgradeable()` in `internal/services/downloader/` handle tier ranking
@@ -189,9 +190,9 @@ See [ADR-0007](docs/adr/0007-reconcile-local-import.md).
 
 ## Metadata Tagging
 
-`internal/services/tagger` writes ID3v2 (MP3), Vorbis comments (FLAC), and RIFF INFO (WAV) — title, artist, album, track, disc, year, and cover art (MP3/FLAC).
+`internal/services/tagger` writes ID3v2 (MP3), Vorbis comments (FLAC), and RIFF INFO (WAV) — title, artist, album artist (`ALBUMARTIST` / `TPE2`), album, track, disc, year, and cover art (MP3/FLAC).
 
-**Non-destructive.** The tagger reads the file's existing tags and overwrites *only* Crate's own fields, preserving everything else — ReplayGain, MusicBrainz/AcoustID/ISRC identifiers, and any other foreign tags. This matters because Music Assistant's analysis providers write ReplayGain and a MusicBrainz recording id back into the same files; the old "rebuild a fresh tag block" behavior silently wiped them. FLAC seeds a comment block from the existing one minus Crate's keys; MP3 opens with `Parse:true` and `DeleteFrames` only Crate's own frames before re-adding (so pre-tagged Soulseek files don't accumulate dupes). Regression tests in `service_test.go` prove foreign tags survive a re-tag.
+**Non-destructive & album-unifying.** The tagger reads the file's existing tags and overwrites Crate's own fields plus conflicting album-grouping tags (`ALBUM ARTIST`, `COMPILATION`/`TCMP`, `ALBUMSORT`/`TSOA`, `DISCSUBTITLE`/`TSST`, stale `MUSICBRAINZ_ALBUMID`, etc.) so tracks downloaded from mixed sources always group into one single album, while preserving non-album foreign tags — ReplayGain, MusicBrainz recording IDs (`MUSICBRAINZ_TRACKID` / `UFID`), AcoustID, ISRC, and other custom fields. Regression tests in `service_test.go` prove foreign tags survive a re-tag and conflicting album tags are unified.
 
 > Historical: Crate used to write a `crate:{track_id}` comment tag so the (retired) Haystack app could bridge back by ID. Dropped — the MA reject watcher maps by file path instead.
 
