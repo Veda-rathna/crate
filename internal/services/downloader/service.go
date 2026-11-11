@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -299,6 +300,11 @@ func (s *Service) tick(ctx context.Context) {
 			continue
 		}
 		if err := s.process(ctx, d); err != nil {
+			var rlErr *arcod.RateLimitError
+			if errors.As(err, &rlErr) {
+				slog.Info("downloader: pausing pending batch for arcod rate limit cooldown", "retry_after", rlErr.RetryAfter)
+				break
+			}
 			slog.Error("downloader: process", "download_id", d.ID, "error", err)
 		}
 		slots--
@@ -447,8 +453,22 @@ const (
 	arcodDownloaded arcodOutcome = iota
 	arcodOrganizePending
 	arcodNoMatch
+	arcodRateLimited
 	arcodFailed
 )
+
+func (s *Service) deferRateLimitedRetry(d models.DownloadQueueItem, err error) error {
+	wait := 60 * time.Second
+	var rlErr *arcod.RateLimitError
+	if errors.As(err, &rlErr) && rlErr.RetryAfter > 0 {
+		wait = rlErr.RetryAfter + 2*time.Second
+	}
+	retryAt := time.Now().UTC().Add(wait).Format(time.RFC3339)
+	slog.Info("downloader: arcod rate limited, deferring retry without counting attempt",
+		"download_id", d.ID, "retry_in", wait.Round(time.Second))
+	_ = s.queries.UpdateTrackStatus(d.TrackID, models.TrackStatusWanted)
+	return s.queries.ScheduleDeferredRetry(d.ID, retryAt, err.Error())
+}
 
 // process kicks off a download attempt across enabled sources in priority order.
 func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error {
@@ -469,6 +489,12 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 		if outcome == arcodDownloaded || outcome == arcodOrganizePending {
 			return nil
 		}
+		if outcome == arcodRateLimited {
+			if deferErr := s.deferRateLimitedRetry(d, arcodErr); deferErr != nil {
+				return deferErr
+			}
+			return arcodErr
+		}
 		if s.isSlskdEnabled() {
 			return s.startSlskdSearch(ctx, d, track)
 		}
@@ -487,9 +513,15 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 	// Primary is slskd.
 	if err := s.startSlskdSearch(ctx, d, track); err != nil {
 		if s.isArcodEnabled() {
-			outcome, _ := s.tryArcodDownload(ctx, d, track)
+			outcome, arcodErr := s.tryArcodDownload(ctx, d, track)
 			if outcome == arcodDownloaded || outcome == arcodOrganizePending {
 				return nil
+			}
+			if outcome == arcodRateLimited {
+				if deferErr := s.deferRateLimitedRetry(d, arcodErr); deferErr != nil {
+					return deferErr
+				}
+				return arcodErr
 			}
 		}
 		return s.failWithRetry(d, err.Error())
@@ -520,6 +552,11 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 		DurationMs: track.DurationMs,
 	})
 	if err != nil {
+		var rlErr *arcod.RateLimitError
+		if errors.As(err, &rlErr) {
+			slog.Warn("downloader: arcod search rate limited", "retry_after", rlErr.RetryAfter, "track_id", track.ID)
+			return arcodRateLimited, err
+		}
 		slog.Warn("downloader: arcod search error", "error", err, "track_id", track.ID)
 		return arcodFailed, err
 	}
@@ -600,9 +637,12 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 	if best == nil {
 		_ = s.slskd.DeleteSearch(ctx, *d.SlskdSearchID)
 		if s.shouldFallbackToArcodAfterSlskd() {
-			outcome, _ := s.tryArcodDownload(ctx, d, track)
+			outcome, arcodErr := s.tryArcodDownload(ctx, d, track)
 			if outcome == arcodDownloaded || outcome == arcodOrganizePending {
 				return nil
+			}
+			if outcome == arcodRateLimited {
+				return s.deferRateLimitedRetry(d, arcodErr)
 			}
 		}
 		errStr := "no suitable file found"

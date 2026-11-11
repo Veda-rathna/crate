@@ -19,14 +19,32 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 )
 
 const (
-	DefaultBaseURL = "https://arcod.xyz"
-	DefaultQuality = 27 // 27 = Hi-Res / 24-bit FLAC; 6 = 16-bit FLAC
+	DefaultBaseURL         = "https://arcod.xyz"
+	DefaultQuality         = 27 // 27 = Hi-Res / 24-bit FLAC; 6 = 16-bit FLAC
+	defaultSearchCacheTTL  = 2 * time.Minute
+	defaultSearchRateLimit = 5 * time.Second // 12 searches/min steady state (under arcod's 14/min limit)
+	defaultRetryAfter      = 60 * time.Second
 )
+
+// RateLimitError indicates arcod rejected a search with HTTP 429 or is in active cooldown.
+type RateLimitError struct {
+	RetryAfter time.Duration
+	Message    string
+}
+
+func (e *RateLimitError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("arcod rate limited (retry after %s)", e.RetryAfter)
+}
 
 type TrackItem struct {
 	ID                  int64   `json:"id"`
@@ -86,18 +104,29 @@ type rawTrack struct {
 	} `json:"album"`
 }
 
+type cachedSearch struct {
+	items     []TrackItem
+	expiresAt time.Time
+}
+
 type Client struct {
-	queries      *db.Queries
-	downloadsDir string
-	httpClient   *http.Client
-	mu           sync.Mutex
-	cachedToken  string
+	queries          *db.Queries
+	downloadsDir     string
+	httpClient       *http.Client
+	mu               sync.Mutex
+	cachedToken      string
+	rateMu           sync.Mutex
+	searchLimiter    *rate.Limiter
+	rateLimitedUntil time.Time
+	searchCache      map[string]cachedSearch
 }
 
 func NewClient(queries *db.Queries, downloadsDir string) *Client {
 	return &Client{
-		queries:      queries,
-		downloadsDir: downloadsDir,
+		queries:       queries,
+		downloadsDir:  downloadsDir,
+		searchLimiter: rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
+		searchCache:   make(map[string]cachedSearch),
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -107,6 +136,13 @@ func NewClient(queries *db.Queries, downloadsDir string) *Client {
 // SetHTTPClient allows overriding the HTTP client in tests.
 func (c *Client) SetHTTPClient(hc *http.Client) {
 	c.httpClient = hc
+}
+
+// SetSearchLimiter overrides the proactive search rate limiter (useful in unit tests).
+func (c *Client) SetSearchLimiter(l *rate.Limiter) {
+	c.rateMu.Lock()
+	c.searchLimiter = l
+	c.rateMu.Unlock()
 }
 
 func (c *Client) BaseURL() string {
@@ -275,8 +311,33 @@ func (c *Client) signup(ctx context.Context, baseURL, email, password string) (s
 	return res.Token, nil
 }
 
-// Search queries the arcod music API.
+// Search queries the arcod music API, pacing requests under arcod's 14/min rate limit
+// and honoring HTTP 429 retryAfterSeconds cooldowns across callers.
 func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) {
+	cacheKey := strings.ToLower(strings.TrimSpace(query))
+
+	c.rateMu.Lock()
+	if entry, ok := c.searchCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		items := append([]TrackItem(nil), entry.items...)
+		c.rateMu.Unlock()
+		return items, nil
+	}
+	if remaining := time.Until(c.rateLimitedUntil); remaining > 0 {
+		c.rateMu.Unlock()
+		return nil, &RateLimitError{
+			RetryAfter: remaining,
+			Message:    fmt.Sprintf("arcod search rate limit cooldown active (%s remaining)", remaining.Round(time.Second)),
+		}
+	}
+	limiter := c.searchLimiter
+	c.rateMu.Unlock()
+
+	if limiter != nil {
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	baseURL := c.BaseURL()
 	searchURL := fmt.Sprintf("%s/api/get-music?q=%s", baseURL, url.QueryEscape(query))
 
@@ -290,6 +351,18 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		b, _ := io.ReadAll(resp.Body)
+		retryAfter := parseRetryAfter(b, resp.Header.Get("Retry-After"))
+		c.rateMu.Lock()
+		c.rateLimitedUntil = time.Now().Add(retryAfter)
+		c.rateMu.Unlock()
+		return nil, &RateLimitError{
+			RetryAfter: retryAfter,
+			Message:    fmt.Sprintf("search failed (429): %s", strings.TrimSpace(string(b))),
+		}
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -331,7 +404,42 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 			Album:               raw.Album.Title,
 		})
 	}
+
+	c.rateMu.Lock()
+	if c.searchCache == nil {
+		c.searchCache = make(map[string]cachedSearch)
+	}
+	if len(c.searchCache) >= 200 {
+		now := time.Now()
+		for k, v := range c.searchCache {
+			if now.After(v.expiresAt) {
+				delete(c.searchCache, k)
+			}
+		}
+		if len(c.searchCache) >= 200 {
+			c.searchCache = make(map[string]cachedSearch)
+		}
+	}
+	c.searchCache[cacheKey] = cachedSearch{
+		items:     append([]TrackItem(nil), items...),
+		expiresAt: time.Now().Add(defaultSearchCacheTTL),
+	}
+	c.rateMu.Unlock()
+
 	return items, nil
+}
+
+func parseRetryAfter(body []byte, headerVal string) time.Duration {
+	var payload struct {
+		RetryAfterSeconds int `json:"retryAfterSeconds"`
+	}
+	if json.Unmarshal(body, &payload) == nil && payload.RetryAfterSeconds > 0 {
+		return time.Duration(payload.RetryAfterSeconds) * time.Second
+	}
+	if sec, err := strconv.Atoi(strings.TrimSpace(headerVal)); err == nil && sec > 0 {
+		return time.Duration(sec) * time.Second
+	}
+	return defaultRetryAfter
 }
 
 func parseID(val any) int64 {

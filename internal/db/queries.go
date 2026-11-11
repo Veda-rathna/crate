@@ -943,6 +943,16 @@ func (q *Queries) ScheduleRetry(id int64, retryAt string, errMsg string) error {
 	return err
 }
 
+// ScheduleDeferredRetry schedules a retry after a transient rate limit without
+// burning one of the download's failure retry attempts.
+func (q *Queries) ScheduleDeferredRetry(id int64, retryAt string, errMsg string) error {
+	_, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'failed', error = ?, next_retry_at = ?, last_attempt = ? WHERE id = ?`,
+		errMsg, retryAt, now(), id,
+	)
+	return err
+}
+
 func (q *Queries) ListRetryableDownloads() ([]models.DownloadQueueItem, error) {
 	rows, err := q.db.Query(
 		`SELECT id, track_id, slskd_search_id, status, attempts, last_attempt, error, next_retry_at, source, last_progress_bytes, created_at

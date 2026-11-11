@@ -7,7 +7,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"errors"
+	"golang.org/x/time/rate"
 )
 
 func TestCleanString(t *testing.T) {
@@ -285,6 +290,58 @@ func TestDownloadTrackFLACQualityFallbackAndHeaderCheck(t *testing.T) {
 	}
 	if _, err := os.Stat(badDest); !os.IsNotExist(err) {
 		t.Error("invalid non-FLAC file must not be kept on disk")
+	}
+}
+
+func TestSearchRateLimitCooldownAndCache(t *testing.T) {
+	var hits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Query().Get("q") == "trigger429" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"success":false,"error":"Too many searches from this network (14/min).","retryAfterSeconds":60}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"tracks": map[string]any{"total": 0, "items": []any{}}},
+		})
+	}))
+	defer ts.Close()
+
+	client := NewClient(nil, "")
+	client.SetHTTPClient(ts.Client())
+	client.SetSearchLimiter(rate.NewLimiter(rate.Inf, 1))
+	t.Setenv("CRATE_ARCOD_URL", ts.URL)
+
+	// Identical queries hit short-lived cache instead of hammering arcod.
+	if _, err := client.Search(context.Background(), "Same Query"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Search(context.Background(), "same query"); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected 1 HTTP search (second cached), got %d", hits.Load())
+	}
+
+	// 429 triggers RateLimitError with RetryAfter=60s and stops subsequent calls during cooldown.
+	_, err := client.Search(context.Background(), "trigger429")
+	var rlErr *RateLimitError
+	if !errors.As(err, &rlErr) {
+		t.Fatalf("expected RateLimitError, got %v", err)
+	}
+	if rlErr.RetryAfter != 60*time.Second {
+		t.Errorf("expected RetryAfter=60s, got %v", rlErr.RetryAfter)
+	}
+
+	hitsBefore := hits.Load()
+	_, err = client.Search(context.Background(), "another query")
+	if !errors.As(err, &rlErr) {
+		t.Fatalf("expected cooldown RateLimitError on follow-up call, got %v", err)
+	}
+	if hits.Load() != hitsBefore {
+		t.Errorf("expected 0 HTTP requests during active cooldown, got %d extra", hits.Load()-hitsBefore)
 	}
 }
 

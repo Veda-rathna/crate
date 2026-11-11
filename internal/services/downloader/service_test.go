@@ -1322,3 +1322,51 @@ func TestPollManualSearchOrdersBySourcePriority(t *testing.T) {
 		t.Errorf("expected soulseek-peer first when slskd priority is higher, got %q", resp.Results[0].Username)
 	}
 }
+
+func TestArcodRateLimitDefersWithoutBurningAttemptAndPausesTick(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected slskd request %s %s during arcod rate limit", r.Method, r.URL.Path)
+	}
+	fa := &fakeArcodProvider{
+		enabled: true,
+		downloadErr: &arcod.RateLimitError{
+			RetryAfter: 60 * time.Second,
+			Message:    `search failed (429): {"success":false,"error":"Too many searches","retryAfterSeconds":60}`,
+		},
+	}
+	dl, q, trackID := newPriorityTestService(t, handler, fa)
+
+	// Add a second track so we verify tick pauses remaining pending items instead of failing them too.
+	albums, _ := q.ListAlbumsByArtist(1)
+	track2 := &models.Track{AlbumID: albums[0].ID, Title: "Second Track", TrackNumber: 2, DiscNumber: 1, DurationMs: 180000, Provider: "test", ProviderID: "tr2", Status: models.TrackStatusWanted}
+	if err := q.CreateTrack(track2); err != nil {
+		t.Fatal(err)
+	}
+	_ = q.EnqueueDownload(trackID)
+	_ = q.EnqueueDownload(track2.ID)
+
+	dl.tick(context.Background())
+
+	failed, _ := q.ListDownloads("failed")
+	pending, _ := q.ListDownloads("pending")
+	if len(failed) != 1 {
+		t.Fatalf("expected 1 deferred item and 1 paused pending item, got failed=%d pending=%d", len(failed), len(pending))
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected second track to stay pending during cooldown pause, got %d", len(pending))
+	}
+	if failed[0].Attempts != 0 {
+		t.Errorf("expected Attempts=0 (not burned on 429 rate limit), got %d", failed[0].Attempts)
+	}
+	if failed[0].NextRetryAt == nil {
+		t.Fatal("expected NextRetryAt set for deferred retry")
+	}
+	retryAt, err := time.Parse(time.RFC3339, *failed[0].NextRetryAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := time.Until(retryAt)
+	if delta < 50*time.Second || delta > 70*time.Second {
+		t.Errorf("expected deferred retry around ~62s, got %v", delta)
+	}
+}
