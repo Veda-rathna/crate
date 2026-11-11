@@ -36,11 +36,18 @@ func ParseProviderConfig(s string) []ProviderConfig {
 }
 
 type ProcessManager struct {
-	processes []*os.Process
+	processes   []*os.Process
+	mbUserAgent string
 }
 
 func NewProcessManager() *ProcessManager {
 	return &ProcessManager{}
+}
+
+// SetMusicBrainzUserAgent configures the MB_USER_AGENT value passed to managed
+// provider child processes when MB_USER_AGENT is not already set in the environment.
+func (pm *ProcessManager) SetMusicBrainzUserAgent(ua string) {
+	pm.mbUserAgent = ua
 }
 
 func (pm *ProcessManager) StartProviders(ctx context.Context, manager *Manager, configs []ProviderConfig) error {
@@ -55,6 +62,15 @@ func (pm *ProcessManager) StartProviders(ctx context.Context, manager *Manager, 
 		port := cfg.Address
 		cmd := exec.Command(cfg.Binary)
 		cmd.Env = append(os.Environ(), "PORT="+port)
+		if os.Getenv("MB_USER_AGENT") == "" {
+			mbUA := pm.mbUserAgent
+			if mbUA == "" {
+				mbUA = os.Getenv("CRATE_MB_USER_AGENT")
+			}
+			if mbUA != "" {
+				cmd.Env = append(cmd.Env, "MB_USER_AGENT="+mbUA)
+			}
+		}
 		if manager != nil && manager.queries != nil {
 			if id, err := manager.queries.GetSetting("spotify_client_id"); err == nil && id != "" {
 				cmd.Env = append(cmd.Env, "SPOTIFY_CLIENT_ID="+id)

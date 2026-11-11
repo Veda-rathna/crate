@@ -23,12 +23,15 @@ import (
 	"google.golang.org/grpc"
 	_ "modernc.org/sqlite"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
 
 const (
 	spotifyAPIBaseURL   = "https://api.spotify.com/v1"
 	spotifyTokenBaseURL = "https://accounts.spotify.com/api/token"
+	maxArtistAlbums     = 2000
+	maxRateLimitRetries = 3
 )
 
 type tokenManager struct {
@@ -306,34 +309,46 @@ func (s *server) GetArtistAlbums(ctx context.Context, req *pb.EntityRequest) (*p
 		Images      []imageItem `json:"images"`
 	}
 
+	market := strings.TrimSpace(os.Getenv("SPOTIFY_MARKET"))
 	var allItems []albumEntry
+	seenIDs := make(map[string]bool)
 
-	// Fetch up to 100 albums (2 pages of 50)
-	for offset := 0; offset < 100; offset += 50 {
+	for offset := 0; ; {
 		var resp struct {
 			Total int          `json:"total"`
+			Next  string       `json:"next"`
 			Items []albumEntry `json:"items"`
 		}
 
 		path := fmt.Sprintf("/artists/%s/albums?include_groups=album,single,compilation&limit=50&offset=%d", req.Id, offset)
+		if market != "" {
+			path += "&market=" + url.QueryEscape(market)
+		}
 		if err := s.get(ctx, path, &resp); err != nil {
 			return nil, err
 		}
-		allItems = append(allItems, resp.Items...)
-		if len(allItems) >= resp.Total || len(resp.Items) < 50 {
+
+		for _, item := range resp.Items {
+			if seenIDs[item.ID] {
+				continue
+			}
+			seenIDs[item.ID] = true
+			allItems = append(allItems, item)
+		}
+
+		offset += len(resp.Items)
+		if len(resp.Items) == 0 ||
+			(resp.Next == "" && (resp.Total == 0 || offset >= resp.Total)) ||
+			len(allItems) >= maxArtistAlbums {
 			break
 		}
 	}
 
-	seen := make(map[string]bool)
+	// Deduplicate regional editions by (normalized title, record type, release year)
+	// so distinct releases sharing a title across years or types are kept.
+	dedupIndex := make(map[string]int)
 	var albums []*pb.AlbumSummary
-	for i, a := range allItems {
-		normTitle := strings.ToLower(strings.TrimSpace(a.Name))
-		if seen[normTitle] {
-			continue
-		}
-		seen[normTitle] = true
-
+	for _, a := range allItems {
 		recordType := "album"
 		albumGroup := a.AlbumGroup
 		if albumGroup == "" {
@@ -353,25 +368,43 @@ func (s *server) GetArtistAlbums(ctx context.Context, req *pb.EntityRequest) (*p
 			recordType = "album"
 		}
 
-		year := parseYear(a.ReleaseDate)
-		albums = append(albums, &pb.AlbumSummary{
+		year := releasedate.ParseYear(a.ReleaseDate)
+		dedupKey := strings.ToLower(strings.TrimSpace(a.Name)) + "|" + recordType + "|" + strconv.Itoa(year)
+		summary := &pb.AlbumSummary{
 			Id:         a.ID,
 			Title:      a.Name,
 			CoverUrl:   bestImage(a.Images),
 			Year:       int32(year),
 			RecordType: recordType,
-			Rank:       int32(len(allItems) - i),
 			Metadata: map[string]string{
 				"release_date": a.ReleaseDate,
 				"total_tracks": strconv.Itoa(a.TotalTracks),
 			},
-		})
+		}
+
+		if idx, exists := dedupIndex[dedupKey]; exists {
+			existingDate := albums[idx].Metadata["release_date"]
+			if len(a.ReleaseDate) > len(existingDate) {
+				albums[idx] = summary
+			}
+			continue
+		}
+		dedupIndex[dedupKey] = len(albums)
+		albums = append(albums, summary)
 	}
 
+	releasedate.SortAlbumsDescending(albums)
 	return &pb.AlbumList{Albums: albums}, nil
 }
 
 func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumDetail, error) {
+	type spotifyTrack struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		TrackNumber int    `json:"track_number"`
+		DiscNumber  int    `json:"disc_number"`
+		DurationMs  int    `json:"duration_ms"`
+	}
 	var albumResp struct {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
@@ -381,13 +414,9 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		} `json:"artists"`
 		Images []imageItem `json:"images"`
 		Tracks struct {
-			Items []struct {
-				ID          string `json:"id"`
-				Name        string `json:"name"`
-				TrackNumber int    `json:"track_number"`
-				DiscNumber  int    `json:"disc_number"`
-				DurationMs  int    `json:"duration_ms"`
-			} `json:"items"`
+			Total int            `json:"total"`
+			Next  string         `json:"next"`
+			Items []spotifyTrack `json:"items"`
 		} `json:"tracks"`
 	}
 
@@ -395,14 +424,32 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		return nil, err
 	}
 
+	allTracks := append([]spotifyTrack(nil), albumResp.Tracks.Items...)
+	nextURL := albumResp.Tracks.Next
+	for offset := len(allTracks); nextURL != "" && len(allTracks) < maxArtistAlbums; {
+		var page struct {
+			Next  string         `json:"next"`
+			Items []spotifyTrack `json:"items"`
+		}
+		if err := s.get(ctx, fmt.Sprintf("/albums/%s/tracks?limit=50&offset=%d", req.Id, offset), &page); err != nil {
+			break
+		}
+		allTracks = append(allTracks, page.Items...)
+		offset += len(page.Items)
+		nextURL = page.Next
+		if len(page.Items) == 0 {
+			break
+		}
+	}
+
 	artistName := "Unknown"
 	if len(albumResp.Artists) > 0 {
 		artistName = albumResp.Artists[0].Name
 	}
 
-	year := parseYear(albumResp.ReleaseDate)
+	year := releasedate.ParseYear(albumResp.ReleaseDate)
 	var tracks []*pb.TrackInfo
-	for _, t := range albumResp.Tracks.Items {
+	for _, t := range allTracks {
 		tracks = append(tracks, &pb.TrackInfo{
 			Id:          t.ID,
 			Title:       t.Name,
@@ -475,7 +522,7 @@ func (s *server) SearchArtistTracks(ctx context.Context, req *pb.ArtistTrackSear
 			AlbumId:       t.Album.ID,
 			AlbumTitle:    t.Album.Name,
 			AlbumCoverUrl: bestImage(t.Album.Images),
-			AlbumYear:     int32(parseYear(t.Album.ReleaseDate)),
+			AlbumYear:     int32(releasedate.ParseYear(t.Album.ReleaseDate)),
 		})
 	}
 
@@ -483,48 +530,53 @@ func (s *server) SearchArtistTracks(ctx context.Context, req *pb.ArtistTrackSear
 }
 
 func (s *server) get(ctx context.Context, path string, out any) error {
-	if err := s.limiter.Wait(ctx); err != nil {
-		return err
-	}
-
-	token, err := s.tokenMgr.GetToken(ctx)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", s.baseURL+path, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := s.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfterStr := resp.Header.Get("Retry-After")
-		waitSec, _ := strconv.Atoi(retryAfterStr)
-		if waitSec <= 0 {
-			waitSec = 1
+	for attempt := 0; attempt <= maxRateLimitRetries; attempt++ {
+		if err := s.limiter.Wait(ctx); err != nil {
+			return err
 		}
-		time.Sleep(time.Duration(waitSec) * time.Second)
-		return s.get(ctx, path, out)
-	}
 
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("spotify API returned status %d: %s", resp.StatusCode, string(b))
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
-}
+		token, err := s.tokenMgr.GetToken(ctx)
+		if err != nil {
+			return err
+		}
 
-func parseYear(dateStr string) int {
-	if len(dateStr) >= 4 {
-		y, _ := strconv.Atoi(dateStr[:4])
-		return y
+		req, err := http.NewRequestWithContext(ctx, "GET", s.baseURL+path, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := s.http.Do(req)
+		if err != nil {
+			return err
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfterStr := resp.Header.Get("Retry-After")
+			resp.Body.Close()
+			if attempt == maxRateLimitRetries {
+				return fmt.Errorf("spotify API rate limited (429) after %d retries", maxRateLimitRetries)
+			}
+			waitSec, _ := strconv.Atoi(retryAfterStr)
+			if waitSec <= 0 {
+				waitSec = 1
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(waitSec) * time.Second):
+			}
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("spotify API returned status %d: %s", resp.StatusCode, string(b))
+		}
+		err = json.NewDecoder(resp.Body).Decode(out)
+		resp.Body.Close()
+		return err
 	}
-	return 0
+	return fmt.Errorf("spotify API request exhausted retries")
 }

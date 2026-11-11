@@ -245,3 +245,52 @@ func TestArtistLanguages(t *testing.T) {
 		t.Errorf("expected wanted track with ArtistLanguages, got %v", wanted)
 	}
 }
+
+func TestListAlbumsByArtistOrdersNewestFirst(t *testing.T) {
+	q := newTestQueries(t)
+	artist := &models.Artist{Name: "Artist", Provider: "test", ProviderID: "a1", Status: models.ArtistStatusWatched}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	y1997, y2026 := 1997, 2026
+	_ = q.CreateAlbum(&models.Album{ArtistID: artist.ID, Title: "Old", Year: &y1997, Provider: "test", ProviderID: "al-old", RecordType: "album", Status: models.AlbumStatusWatched})
+	_ = q.CreateAlbum(&models.Album{ArtistID: artist.ID, Title: "Unknown", Year: nil, Provider: "test", ProviderID: "al-nil", RecordType: "album", Status: models.AlbumStatusWatched})
+	_ = q.CreateAlbum(&models.Album{ArtistID: artist.ID, Title: "Latest", Year: &y2026, Provider: "test", ProviderID: "al-new", RecordType: "album", Status: models.AlbumStatusWatched})
+
+	albums, err := q.ListAlbumsByArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 3 {
+		t.Fatalf("expected 3 albums, got %d", len(albums))
+	}
+	if albums[0].Title != "Latest" || albums[1].Title != "Old" || albums[2].Title != "Unknown" {
+		t.Errorf("unexpected album order: [%s, %s, %s]", albums[0].Title, albums[1].Title, albums[2].Title)
+	}
+}
+
+func TestSetArtistWatchNewReleasesPreservesExistingSince(t *testing.T) {
+	q := newTestQueries(t)
+	since := "2025-01-01T00:00:00Z"
+	artist := &models.Artist{
+		Name:                  "Artist",
+		Provider:              "test",
+		ProviderID:            "a1",
+		Status:                models.ArtistStatusWatched,
+		WatchNewReleases:      true,
+		WatchNewReleasesSince: &since,
+	}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	_ = q.SetArtistWatchNewReleases(artist.ID, false)
+	_ = q.SetArtistWatchNewReleases(artist.ID, true)
+
+	got, err := q.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WatchNewReleasesSince == nil || *got.WatchNewReleasesSince != since {
+		t.Errorf("expected WatchNewReleasesSince preserved as %q, got %v", since, got.WatchNewReleasesSince)
+	}
+}

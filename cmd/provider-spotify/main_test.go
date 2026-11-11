@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -283,25 +284,15 @@ func TestSpotifyGetArtistAlbums(t *testing.T) {
 		t.Fatalf("expected 3 albums, got %d", len(resp.Albums))
 	}
 
-	// OK Computer
-	if resp.Albums[0].Title != "OK Computer" {
-		t.Errorf("expected 'OK Computer', got %q", resp.Albums[0].Title)
+	// Sorted newest-first: Airbag EP (1998) -> Paranoid Android (1997-05-26) -> OK Computer (1997-05-21)
+	if resp.Albums[0].RecordType != "ep" {
+		t.Errorf("expected newest album Airbag EP (record_type 'ep') first, got %q (%s)", resp.Albums[0].RecordType, resp.Albums[0].Title)
 	}
-	if resp.Albums[0].Year != 1997 {
-		t.Errorf("expected year 1997, got %d", resp.Albums[0].Year)
-	}
-	if resp.Albums[0].RecordType != "album" {
-		t.Errorf("expected record_type 'album', got %q", resp.Albums[0].RecordType)
-	}
-
-	// Paranoid Android (Single)
 	if resp.Albums[1].RecordType != "single" {
 		t.Errorf("expected record_type 'single', got %q", resp.Albums[1].RecordType)
 	}
-
-	// Airbag / How Am I Driving? EP (7 tracks, but contains 'ep' in title)
-	if resp.Albums[2].RecordType != "ep" {
-		t.Errorf("expected record_type 'ep', got %q", resp.Albums[2].RecordType)
+	if resp.Albums[2].Title != "OK Computer" || resp.Albums[2].Year != 1997 || resp.Albums[2].RecordType != "album" {
+		t.Errorf("expected 'OK Computer' (1997 album) third, got %+v", resp.Albums[2])
 	}
 }
 
@@ -502,6 +493,83 @@ func TestSpotifyAPIError(t *testing.T) {
 	_, err := client.SearchArtists(context.Background(), &pb.SearchRequest{Query: "test"})
 	if err == nil {
 		t.Fatal("expected error on 500 response")
+	}
+}
+
+func TestSpotifyGetArtistAlbumsPaginatesPast100AndKeepsSameTitleAcrossYears(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/artists/art-1/albums", func(w http.ResponseWriter, r *http.Request) {
+		offset := r.URL.Query().Get("offset")
+		var items []map[string]any
+		next := ""
+		switch offset {
+		case "", "0":
+			for i := 0; i < 50; i++ {
+				items = append(items, map[string]any{
+					"id":           fmt.Sprintf("alb-%03d", i),
+					"name":         fmt.Sprintf("Catalog Album %03d", i),
+					"album_type":   "album",
+					"album_group":  "album",
+					"total_tracks": 10,
+					"release_date": "2010-01-01",
+				})
+			}
+			next = "http://next/1"
+		case "50":
+			for i := 50; i < 100; i++ {
+				items = append(items, map[string]any{
+					"id":           fmt.Sprintf("alb-%03d", i),
+					"name":         fmt.Sprintf("Catalog Album %03d", i),
+					"album_type":   "album",
+					"album_group":  "album",
+					"total_tracks": 10,
+					"release_date": "2015-01-01",
+				})
+			}
+			next = "http://next/2"
+		case "100":
+			items = append(items,
+				map[string]any{
+					"id":           "same-title-single-2026",
+					"name":         "Echoes",
+					"album_type":   "single",
+					"album_group":  "single",
+					"total_tracks": 1,
+					"release_date": "2026-11-05",
+				},
+				map[string]any{
+					"id":           "same-title-album-2024",
+					"name":         "Echoes",
+					"album_type":   "album",
+					"album_group":  "album",
+					"total_tracks": 10,
+					"release_date": "2024-03-01",
+				},
+			)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total": 102,
+			"next":  next,
+			"items": items,
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestSpotifyServer(t, fake.URL, nil)
+
+	resp, err := client.GetArtistAlbums(context.Background(), &pb.EntityRequest{Id: "art-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Albums) != 102 {
+		t.Fatalf("expected 102 albums (past 100 limit + same-title single/album kept), got %d", len(resp.Albums))
+	}
+	if resp.Albums[0].Id != "same-title-single-2026" {
+		t.Errorf("expected newest release same-title-single-2026 first, got %q", resp.Albums[0].Id)
+	}
+	if resp.Albums[1].Id != "same-title-album-2024" {
+		t.Errorf("expected same-title-album-2024 second, got %q", resp.Albums[1].Id)
 	}
 }
 

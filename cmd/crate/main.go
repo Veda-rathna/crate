@@ -75,6 +75,7 @@ func main() {
 	defer cancel()
 
 	procMgr := provider.NewProcessManager()
+	procMgr.SetMusicBrainzUserAgent(cfg.MusicBrainzUserAgent)
 	configs := provider.ParseProviderConfig(cfg.Providers)
 	if err := procMgr.StartProviders(ctx, providerMgr, configs); err != nil {
 		slog.Error("failed to start providers", "error", err)
@@ -100,7 +101,7 @@ func main() {
 		Addr:         ":" + cfg.Port,
 		Handler:      server,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 130 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

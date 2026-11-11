@@ -1,8 +1,9 @@
 import { useMemo, useState, useEffect, useRef } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import { useSystemProcess } from '../context/SystemContext';
+import { useToast } from '../components/Toast';
 import AlphabetRail from '../components/AlphabetRail';
 import FilterBar from '../components/FilterBar';
 import ProgressBar from '../components/ProgressBar';
@@ -13,6 +14,7 @@ import {
   IconGrid,
   IconLibrary,
   IconList,
+  IconRefresh,
   IconSearch,
 } from '../components/Icons';
 import type { Artist } from '../types/index';
@@ -29,6 +31,9 @@ export default function Library() {
     return saved === 'list' || saved === 'grid' ? saved : 'grid';
   });
 
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
   const {
     status,
     activeTasks,
@@ -39,6 +44,21 @@ export default function Library() {
     headline,
     openProcessDrawer,
   } = useSystemProcess();
+
+  const syncAll = useMutation({
+    mutationFn: api.syncAllArtists,
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      toast(
+        res.started > 0
+          ? `Syncing metadata for ${res.started} watched artist${res.started === 1 ? '' : 's'}…`
+          : 'No watched artists need syncing right now',
+        res.started > 0 ? 'success' : 'info'
+      );
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
 
   const { data: artists, isLoading } = useQuery({
     queryKey: ['artists'],
@@ -203,13 +223,24 @@ export default function Library() {
             {counts.totalTracks.toLocaleString()} tracks owned ({ownershipPct}%)
           </p>
         </div>
-        <Link
-          to="/search"
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all shadow-sm"
-        >
-          <IconSearch className="w-3.5 h-3.5" />
-          Add Artist
-        </Link>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => syncAll.mutate()}
+            disabled={syncAll.isPending}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 rounded-xl text-xs font-medium transition-colors disabled:opacity-50"
+          >
+            <IconRefresh className={`w-3.5 h-3.5 ${syncAll.isPending ? 'animate-spin' : ''}`} />
+            <span>{syncAll.isPending ? 'Syncing…' : 'Sync All'}</span>
+          </button>
+          <Link
+            to="/search"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all shadow-sm"
+          >
+            <IconSearch className="w-3.5 h-3.5" />
+            Add Artist
+          </Link>
+        </div>
       </div>
 
       {/* Live Background Work Banner */}

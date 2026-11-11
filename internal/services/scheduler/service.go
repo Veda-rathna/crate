@@ -15,6 +15,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/library"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
+	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 )
 
@@ -43,12 +44,22 @@ func (s *Service) Run(ctx context.Context) {
 	defer tick.Stop()
 	defer integrityTick.Stop()
 	defer upgradeTick.Stop()
+
+	// Run an initial catch-up cycle shortly after startup instead of waiting a full interval.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(2 * time.Second):
+		s.DetectNewReleases(ctx)
+		s.queueWantedTracks()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			s.detectNewReleases(ctx)
+			s.DetectNewReleases(ctx)
 			s.queueWantedTracks()
 		case <-integrityTick.C:
 			s.checkFileIntegrity()
@@ -60,22 +71,32 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 
-func (s *Service) detectNewReleases(ctx context.Context) {
+// DetectNewReleases checks each artist with watch_new_releases enabled for newly
+// available releases (bypassing stale cache) and heals existing 0-track albums.
+func (s *Service) DetectNewReleases(ctx context.Context) {
 	artists, err := s.queries.ListWatchedArtists()
 	if err != nil {
 		slog.Error("scheduler: list watched artists", "error", err)
 		return
 	}
 	for _, artist := range artists {
-		if artist.WatchNewReleasesSince == nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if artist.Status != models.ArtistStatusWatched && artist.WatchNewReleasesSince == nil {
 			continue
 		}
 		if !s.providers.IsHealthy(artist.Provider) {
 			slog.Warn("scheduler: provider unhealthy, skipping artist", "artist", artist.Name, "provider", artist.Provider)
 			continue
 		}
-		sinceTime, _ := time.Parse(time.RFC3339, *artist.WatchNewReleasesSince)
-		albumList, err := s.providers.GetArtistAlbums(ctx, artist.Provider, artist.ProviderID)
+
+		var sinceTime time.Time
+		if artist.WatchNewReleasesSince != nil {
+			sinceTime, _ = time.Parse(time.RFC3339, *artist.WatchNewReleasesSince)
+		}
+
+		albumList, err := s.providers.GetArtistAlbumsFresh(ctx, artist.Provider, artist.ProviderID)
 		if err != nil {
 			slog.Error("scheduler: fetch artist albums", "artist", artist.Name, "error", err)
 			continue
@@ -83,12 +104,20 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 		added := 0
 		for _, pa := range albumList.Albums {
 			if existing, _ := s.queries.FindAlbumByProvider(artist.Provider, pa.Id); existing != nil {
+				_ = s.queries.UpdateAlbumMeta(existing.ID, pa.Title, intPtrOrNil(int(pa.Year)), strPtrOrNil(pa.CoverUrl), pa.RecordType)
+				if existing.Status != models.AlbumStatusIgnored {
+					if tracks, err := s.queries.ListTracksByAlbum(existing.ID); err == nil && len(tracks) == 0 {
+						s.healAlbumTracks(ctx, &artist, existing, pa.Id)
+					}
+				}
 				continue
 			}
-			releaseDate := pa.Metadata["release_date"]
-			if releaseDate != "" {
-				rd, _ := time.Parse("2006-01-02", releaseDate)
-				if rd.Before(sinceTime) {
+
+			// For partial-watch artists, only add releases on or after the watch baseline.
+			// Full-discography ("watched") artists sync all missing non-ignored releases.
+			if artist.Status != models.ArtistStatusWatched && !sinceTime.IsZero() {
+				releaseDate := pa.Metadata["release_date"]
+				if !releasedate.IsOnOrAfter(releaseDate, sinceTime) {
 					continue
 				}
 			}
@@ -103,8 +132,9 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 				}
 			}
 
-			albumDetail, err := s.providers.GetAlbum(ctx, artist.Provider, pa.Id)
+			albumDetail, err := s.providers.GetAlbumFresh(ctx, artist.Provider, pa.Id)
 			if err != nil {
+				slog.Warn("scheduler: fetch album detail", "artist", artist.Name, "album", pa.Title, "error", err)
 				continue
 			}
 
@@ -117,16 +147,19 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 				}
 			}
 
-			year := int(pa.Year)
-			var yearPtr *int
-			if year > 0 {
-				yearPtr = &year
+			year := intPtrOrNil(int(pa.Year))
+			if year == nil && albumDetail.Year > 0 {
+				y := int(albumDetail.Year)
+				year = &y
 			}
 			cover := pa.CoverUrl
+			if cover == "" {
+				cover = albumDetail.CoverUrl
+			}
 			album := models.Album{
 				ArtistID:   artist.ID,
 				Title:      pa.Title,
-				Year:       yearPtr,
+				Year:       year,
 				Provider:   artist.Provider,
 				ProviderID: pa.Id,
 				CoverURL:   strPtrOrNil(cover),
@@ -134,10 +167,11 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 				Status:     models.AlbumStatusWatched,
 			}
 			if err := s.queries.CreateAlbum(&album); err != nil {
+				slog.Error("scheduler: save album", "artist", artist.Name, "album", pa.Title, "error", err)
 				continue
 			}
 			for _, pt := range albumDetail.Tracks {
-				s.queries.CreateTrack(&models.Track{
+				if err := s.queries.CreateTrack(&models.Track{
 					AlbumID:     album.ID,
 					Title:       pt.Title,
 					TrackNumber: int(pt.TrackNumber),
@@ -146,7 +180,9 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 					Provider:    artist.Provider,
 					ProviderID:  pt.Id,
 					Status:      models.TrackStatusWanted,
-				})
+				}); err != nil {
+					slog.Warn("scheduler: create track", "album", pa.Title, "track", pt.Title, "error", err)
+				}
 			}
 			added++
 		}
@@ -155,6 +191,36 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 			s.recordActivity("new_releases", "artist", artist.ID,
 				fmt.Sprintf("Detected %d new release(s) for %s", added, artist.Name))
 		}
+	}
+}
+
+func (s *Service) healAlbumTracks(ctx context.Context, artist *models.Artist, existing *models.Album, providerAlbumID string) {
+	albumDetail, err := s.providers.GetAlbumFresh(ctx, artist.Provider, providerAlbumID)
+	if err != nil {
+		slog.Warn("scheduler: heal album tracks failed", "artist", artist.Name, "album", existing.Title, "error", err)
+		return
+	}
+	if !language.IsAllLanguages(artist.Languages) {
+		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
+		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+			_ = s.queries.UpdateAlbumStatus(existing.ID, models.AlbumStatusIgnored)
+			return
+		}
+	}
+	for _, pt := range albumDetail.Tracks {
+		if _, err := s.queries.FindTrackByProvider(artist.Provider, pt.Id); err == nil {
+			continue
+		}
+		_ = s.queries.CreateTrack(&models.Track{
+			AlbumID:     existing.ID,
+			Title:       pt.Title,
+			TrackNumber: int(pt.TrackNumber),
+			DiscNumber:  int(pt.DiscNumber),
+			DurationMs:  int(pt.DurationMs),
+			Provider:    artist.Provider,
+			ProviderID:  pt.Id,
+			Status:      models.TrackStatusWanted,
+		})
 	}
 }
 
@@ -315,4 +381,11 @@ func strPtrOrNil(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+func intPtrOrNil(v int) *int {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }

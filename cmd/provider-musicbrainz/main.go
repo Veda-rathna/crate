@@ -17,10 +17,14 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
 
-const mbBaseURL = "https://musicbrainz.org/ws/2"
+const (
+	mbBaseURL       = "https://musicbrainz.org/ws/2"
+	maxArtistAlbums = 2000
+)
 
 type server struct {
 	pb.UnimplementedMusicProviderServer
@@ -169,56 +173,90 @@ func (s *server) GetArtist(ctx context.Context, req *pb.EntityRequest) (*pb.Arti
 }
 
 func (s *server) GetArtistAlbums(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumList, error) {
-	var resp struct {
-		ReleaseGroups []struct {
-			ID               string `json:"id"`
-			Title            string `json:"title"`
-			PrimaryType      string `json:"primary-type"`
-			FirstReleaseDate string `json:"first-release-date"`
-		} `json:"release-groups"`
+	type mbReleaseGroup struct {
+		ID               string   `json:"id"`
+		Title            string   `json:"title"`
+		PrimaryType      string   `json:"primary-type"`
+		SecondaryTypes   []string `json:"secondary-types"`
+		FirstReleaseDate string   `json:"first-release-date"`
 	}
 
-	path := fmt.Sprintf("/release-group?artist=%s&limit=100&fmt=json", req.Id)
-	if err := s.get(ctx, path, &resp); err != nil {
-		return nil, err
+	var allRGs []mbReleaseGroup
+	seen := make(map[string]bool)
+
+	for offset := 0; ; offset += 100 {
+		var resp struct {
+			ReleaseGroupCount int              `json:"release-group-count"`
+			ReleaseGroups     []mbReleaseGroup `json:"release-groups"`
+		}
+
+		path := fmt.Sprintf("/release-group?artist=%s&limit=100&offset=%d&fmt=json", req.Id, offset)
+		if err := s.get(ctx, path, &resp); err != nil {
+			return nil, err
+		}
+
+		for _, rg := range resp.ReleaseGroups {
+			if seen[rg.ID] {
+				continue
+			}
+			seen[rg.ID] = true
+			allRGs = append(allRGs, rg)
+		}
+
+		if len(resp.ReleaseGroups) < 100 ||
+			(resp.ReleaseGroupCount > 0 && offset+len(resp.ReleaseGroups) >= resp.ReleaseGroupCount) ||
+			len(allRGs) >= maxArtistAlbums {
+			break
+		}
 	}
 
 	var albums []*pb.AlbumSummary
-	for i, rg := range resp.ReleaseGroups {
-		year := parseYear(rg.FirstReleaseDate)
-		recordType := "album"
-		switch rg.PrimaryType {
-		case "Single":
-			recordType = "single"
-		case "EP":
-			recordType = "ep"
-		case "Compilation":
-			recordType = "compilation"
-		}
+	for _, rg := range allRGs {
+		year := releasedate.ParseYear(rg.FirstReleaseDate)
 		albums = append(albums, &pb.AlbumSummary{
 			Id:         rg.ID,
 			Title:      rg.Title,
 			Year:       int32(year),
 			CoverUrl:   "https://coverartarchive.org/release-group/" + rg.ID + "/front-250",
-			RecordType: recordType,
-			Rank:       int32(len(resp.ReleaseGroups) - i),
+			RecordType: mapMBRecordType(rg.PrimaryType, rg.SecondaryTypes),
 			Metadata: map[string]string{
 				"release_date": rg.FirstReleaseDate,
 			},
 		})
 	}
 
+	releasedate.SortAlbumsDescending(albums)
 	return &pb.AlbumList{Albums: albums}, nil
 }
 
+func mapMBRecordType(primary string, secondary []string) string {
+	for _, sec := range secondary {
+		if sec == "Compilation" {
+			return "compilation"
+		}
+	}
+	switch primary {
+	case "Single":
+		return "single"
+	case "EP":
+		return "ep"
+	case "Compilation":
+		return "compilation"
+	default:
+		return "album"
+	}
+}
+
 func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumDetail, error) {
+	type mbRelease struct {
+		ID     string `json:"id"`
+		Date   string `json:"date"`
+		Status string `json:"status"`
+	}
 	var rgResp struct {
-		ID       string `json:"id"`
-		Title    string `json:"title"`
-		Releases []struct {
-			ID   string `json:"id"`
-			Date string `json:"date"`
-		} `json:"releases"`
+		ID           string      `json:"id"`
+		Title        string      `json:"title"`
+		Releases     []mbRelease `json:"releases"`
 		ArtistCredit []struct {
 			Artist struct {
 				Name string `json:"name"`
@@ -236,13 +274,28 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		artistName = rgResp.ArtistCredit[0].Artist.Name
 	}
 
-	year := parseYear(rgResp.FirstReleaseDate)
+	year := releasedate.ParseYear(rgResp.FirstReleaseDate)
+
+	// Prefer Official releases first so a stub/promo release doesn't hide the real tracklist.
+	var ordered []mbRelease
+	for _, rel := range rgResp.Releases {
+		if rel.Status == "Official" {
+			ordered = append(ordered, rel)
+		}
+	}
+	for _, rel := range rgResp.Releases {
+		if rel.Status != "Official" {
+			ordered = append(ordered, rel)
+		}
+	}
 
 	var tracks []*pb.TrackInfo
 	albumMetadata := map[string]string{}
-	if len(rgResp.Releases) > 0 {
-		releaseID := rgResp.Releases[0].ID
-
+	maxAttempts := 3
+	if len(ordered) < maxAttempts {
+		maxAttempts = len(ordered)
+	}
+	for i := 0; i < maxAttempts; i++ {
 		var relResp struct {
 			TextRepresentation struct {
 				Language string `json:"language"`
@@ -260,29 +313,40 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 			} `json:"media"`
 		}
 
-		if err := s.get(ctx, "/release/"+releaseID+"?inc=recordings&fmt=json", &relResp); err == nil {
+		if err := s.get(ctx, "/release/"+ordered[i].ID+"?inc=recordings&fmt=json", &relResp); err != nil {
+			continue
+		}
+
+		var candidateTracks []*pb.TrackInfo
+		for _, media := range relResp.Media {
+			for _, t := range media.Tracks {
+				trackNum, _ := strconv.Atoi(t.Number)
+				if trackNum == 0 {
+					trackNum = t.Position
+				}
+				candidateTracks = append(candidateTracks, &pb.TrackInfo{
+					Id:          t.ID,
+					Title:       t.Title,
+					TrackNumber: int32(trackNum),
+					DiscNumber:  int32(media.Position),
+					DurationMs:  int32(t.Length),
+					Rank:        int32(t.Position),
+				})
+			}
+		}
+
+		if len(candidateTracks) > 0 || len(tracks) == 0 {
+			tracks = candidateTracks
+			albumMetadata = map[string]string{}
 			if relResp.TextRepresentation.Language != "" {
 				albumMetadata["language"] = relResp.TextRepresentation.Language
 			}
 			if relResp.TextRepresentation.Script != "" {
 				albumMetadata["script"] = relResp.TextRepresentation.Script
 			}
-			for _, media := range relResp.Media {
-				for _, t := range media.Tracks {
-					trackNum, _ := strconv.Atoi(t.Number)
-					if trackNum == 0 {
-						trackNum = t.Position
-					}
-					tracks = append(tracks, &pb.TrackInfo{
-						Id:          t.ID,
-						Title:       t.Title,
-						TrackNumber: int32(trackNum),
-						DiscNumber:  int32(media.Position),
-						DurationMs:  int32(t.Length),
-						Rank:        int32(t.Position),
-					})
-				}
-			}
+		}
+		if len(tracks) > 0 {
+			break
 		}
 	}
 
@@ -347,7 +411,7 @@ func (s *server) SearchArtistTracks(ctx context.Context, req *pb.ArtistTrackSear
 			t.AlbumId = rgID
 			t.AlbumTitle = rel.Title
 			t.AlbumCoverUrl = "https://coverartarchive.org/release-group/" + rgID + "/front-250"
-			t.AlbumYear = int32(parseYear(rel.Date))
+			t.AlbumYear = int32(releasedate.ParseYear(rel.Date))
 		}
 		tracks = append(tracks, t)
 	}
@@ -377,12 +441,4 @@ func (s *server) get(ctx context.Context, path string, out any) error {
 	}
 
 	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-func parseYear(dateStr string) int {
-	if len(dateStr) >= 4 {
-		y, _ := strconv.Atoi(dateStr[:4])
-		return y
-	}
-	return 0
 }

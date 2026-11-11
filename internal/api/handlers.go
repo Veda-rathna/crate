@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/naming"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
+	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/reject"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
@@ -65,6 +67,28 @@ func (s *Server) startTask(id, kind, title, detail string, total int, entityID i
 		EntityID:  entityID,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+// tryStartTask registers a background task only if no task with the same id is currently active.
+func (s *Server) tryStartTask(id, kind, title, detail string, total int, entityID int64) bool {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	if s.tasks == nil {
+		s.tasks = make(map[string]*BackgroundTask)
+	}
+	if _, exists := s.tasks[id]; exists {
+		return false
+	}
+	s.tasks[id] = &BackgroundTask{
+		ID:        id,
+		Kind:      kind,
+		Title:     title,
+		Detail:    detail,
+		Total:     total,
+		EntityID:  entityID,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	return true
 }
 
 func (s *Server) updateTask(id string, current int, detail string) {
@@ -367,15 +391,23 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 
 	existing, _ := s.queries.FindArtistByProvider(primary, providerID)
 
-	artistDetail, err := s.providers.GetArtist(r.Context(), primary, providerID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to fetch artist")
-		return
+	var artistDetail *pb.ArtistDetail
+	var albumList *pb.AlbumList
+	var err error
+	if existing != nil {
+		// Re-watching an existing artist should fetch fresh provider data rather than stale cache.
+		artistDetail, err = s.providers.GetArtistFresh(r.Context(), primary, providerID)
+		if err == nil {
+			albumList, err = s.providers.GetArtistAlbumsFresh(r.Context(), primary, providerID)
+		}
+	} else {
+		artistDetail, err = s.providers.GetArtist(r.Context(), primary, providerID)
+		if err == nil {
+			albumList, err = s.providers.GetArtistAlbums(r.Context(), primary, providerID)
+		}
 	}
-
-	albumList, err := s.providers.GetArtistAlbums(r.Context(), primary, providerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to fetch artist albums")
+		writeError(w, http.StatusInternalServerError, "failed to fetch artist metadata")
 		return
 	}
 
@@ -384,6 +416,7 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to update artist status")
 			return
 		}
+		_ = s.queries.UpdateArtistMeta(existing.ID, artistDetail.Name, strPtrOrNil(artistDetail.ImageUrl))
 		if req.WatchNewReleases {
 			if err := s.queries.SetArtistWatchNewReleases(existing.ID, true); err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to update new releases setting")
@@ -399,19 +432,21 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 		albums := albumList.Albums
 		s.recordActivity("artist_watched", "artist", existing.ID,
 			fmt.Sprintf("Started watching full discography for %s (%d releases)", existing.Name, len(albums)))
-		s.startTask(
-			fmt.Sprintf("sync-artist-%d", existing.ID),
+		taskID := fmt.Sprintf("sync-artist-%d", existing.ID)
+		if s.tryStartTask(
+			taskID,
 			"sync_artist",
 			fmt.Sprintf("Syncing discography: %s", existing.Name),
 			fmt.Sprintf("Preparing %d releases...", len(albums)),
 			len(albums),
 			existing.ID,
-		)
-		s.bgWork.Add(1)
-		go func() {
-			defer s.bgWork.Done()
-			s.saveAlbumsFromProvider(primary, existing.ID, albums)
-		}()
+		) {
+			s.bgWork.Add(1)
+			go func() {
+				defer s.bgWork.Done()
+				s.saveAlbumsWithOptions(primary, existing.ID, albums, true)
+			}()
+		}
 
 		writeJSON(w, http.StatusOK, existing)
 		return
@@ -439,24 +474,175 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 	albums := albumList.Albums
 	s.recordActivity("artist_watched", "artist", artist.ID,
 		fmt.Sprintf("Added %s to library (%d releases)", artist.Name, len(albums)))
-	s.startTask(
-		fmt.Sprintf("sync-artist-%d", artist.ID),
+	taskID := fmt.Sprintf("sync-artist-%d", artist.ID)
+	if s.tryStartTask(
+		taskID,
 		"sync_artist",
 		fmt.Sprintf("Syncing discography: %s", artist.Name),
 		fmt.Sprintf("Preparing %d releases...", len(albums)),
 		len(albums),
 		artist.ID,
-	)
-	s.bgWork.Add(1)
-	go func() {
-		defer s.bgWork.Done()
-		s.saveAlbumsFromProvider(primary, artist.ID, albums)
-	}()
+	) {
+		s.bgWork.Add(1)
+		go func() {
+			defer s.bgWork.Done()
+			s.saveAlbumsWithOptions(primary, artist.ID, albums, false)
+		}()
+	}
 
 	writeJSON(w, http.StatusCreated, artist)
 }
 
+func (s *Server) handleSyncArtist(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	artist, err := s.queries.GetArtist(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "artist not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get artist")
+		return
+	}
+	if artist.Provider == provider.LocalProvider {
+		writeError(w, http.StatusBadRequest, "artist is not linked to a metadata provider")
+		return
+	}
+	if !s.providers.HasProvider(artist.Provider) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("provider %q is not configured", artist.Provider))
+		return
+	}
+
+	if !s.syncArtistAsync(artist, true) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already_syncing"})
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "syncing"})
+}
+
+func (s *Server) handleSyncAllArtists(w http.ResponseWriter, r *http.Request) {
+	artists, err := s.queries.ListArtists()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list artists")
+		return
+	}
+
+	started := 0
+	for i := range artists {
+		a := &artists[i]
+		if a.Provider == provider.LocalProvider || !s.providers.HasProvider(a.Provider) {
+			continue
+		}
+		if a.Status != models.ArtistStatusWatched && !a.WatchNewReleases {
+			continue
+		}
+		if s.syncArtistAsync(a, true) {
+			started++
+		}
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":  "syncing",
+		"started": started,
+	})
+}
+
+func (s *Server) syncArtistAsync(artist *models.Artist, skipCache bool) bool {
+	taskID := fmt.Sprintf("sync-artist-%d", artist.ID)
+	if !s.tryStartTask(
+		taskID,
+		"sync_artist",
+		fmt.Sprintf("Syncing metadata: %s", artist.Name),
+		fmt.Sprintf("Fetching latest releases from %s...", artist.Provider),
+		0,
+		artist.ID,
+	) {
+		return false
+	}
+
+	artistCopy := *artist
+	s.bgWork.Add(1)
+	go func() {
+		defer s.bgWork.Done()
+		defer s.finishTask(taskID)
+
+		ctx := context.Background()
+		var artistDetail *pb.ArtistDetail
+		var albumList *pb.AlbumList
+		var err error
+		if skipCache {
+			artistDetail, err = s.providers.GetArtistFresh(ctx, artistCopy.Provider, artistCopy.ProviderID)
+			if err == nil {
+				_ = s.queries.UpdateArtistMeta(artistCopy.ID, artistDetail.Name, strPtrOrNil(artistDetail.ImageUrl))
+			}
+			albumList, err = s.providers.GetArtistAlbumsFresh(ctx, artistCopy.Provider, artistCopy.ProviderID)
+		} else {
+			artistDetail, err = s.providers.GetArtist(ctx, artistCopy.Provider, artistCopy.ProviderID)
+			if err == nil {
+				_ = s.queries.UpdateArtistMeta(artistCopy.ID, artistDetail.Name, strPtrOrNil(artistDetail.ImageUrl))
+			}
+			albumList, err = s.providers.GetArtistAlbums(ctx, artistCopy.Provider, artistCopy.ProviderID)
+		}
+		if err != nil {
+			slog.Error("sync artist: fetch discography", "artist_id", artistCopy.ID, "provider", artistCopy.Provider, "error", err)
+			return
+		}
+
+		// Reload artist so language/status/watch_new_releases_since reflect latest DB state.
+		freshArtist, err := s.queries.GetArtist(artistCopy.ID)
+		if err != nil || freshArtist == nil {
+			freshArtist = &artistCopy
+		}
+
+		albums := s.filterAlbumsForSync(freshArtist, albumList.Albums)
+		s.startTask(
+			taskID,
+			"sync_artist",
+			fmt.Sprintf("Syncing discography: %s", freshArtist.Name),
+			fmt.Sprintf("Checking %d releases...", len(albums)),
+			len(albums),
+			freshArtist.ID,
+		)
+		s.processArtistAlbums(ctx, freshArtist.Provider, freshArtist.ID, freshArtist.Name, albums, skipCache, taskID)
+	}()
+	return true
+}
+
+// filterAlbumsForSync ensures full-discography ("watched") artists receive all releases
+// while partial/owned artists only update existing albums and (if WatchNewReleases is on)
+// newly released albums on or after WatchNewReleasesSince.
+func (s *Server) filterAlbumsForSync(artist *models.Artist, albums []*pb.AlbumSummary) []*pb.AlbumSummary {
+	if artist.Status == models.ArtistStatusWatched {
+		return albums
+	}
+	var sinceTime time.Time
+	if artist.WatchNewReleases && artist.WatchNewReleasesSince != nil {
+		sinceTime, _ = time.Parse(time.RFC3339, *artist.WatchNewReleasesSince)
+	}
+	var filtered []*pb.AlbumSummary
+	for _, pa := range albums {
+		if existing, _ := s.queries.FindAlbumByProvider(artist.Provider, pa.Id); existing != nil {
+			filtered = append(filtered, pa)
+			continue
+		}
+		if artist.WatchNewReleases && (sinceTime.IsZero() || releasedate.IsOnOrAfter(pa.Metadata["release_date"], sinceTime)) {
+			filtered = append(filtered, pa)
+		}
+	}
+	return filtered
+}
+
 func (s *Server) saveAlbumsFromProvider(providerName string, artistID int64, albums []*pb.AlbumSummary) {
+	s.saveAlbumsWithOptions(providerName, artistID, albums, false)
+}
+
+func (s *Server) saveAlbumsWithOptions(providerName string, artistID int64, albums []*pb.AlbumSummary, skipCache bool) {
 	ctx := context.Background()
 	taskID := fmt.Sprintf("sync-artist-%d", artistID)
 	artistName := fmt.Sprintf("Artist #%d", artistID)
@@ -466,15 +652,20 @@ func (s *Server) saveAlbumsFromProvider(providerName string, artistID int64, alb
 	s.startTask(taskID, "sync_artist", fmt.Sprintf("Syncing discography: %s", artistName), "Starting...", len(albums), artistID)
 	defer s.finishTask(taskID)
 
+	s.processArtistAlbums(ctx, providerName, artistID, artistName, albums, skipCache, taskID)
+}
+
+func (s *Server) processArtistAlbums(ctx context.Context, providerName string, artistID int64, artistName string, albums []*pb.AlbumSummary, skipCache bool, taskID string) {
 	for i, pa := range albums {
 		s.updateTask(taskID, i+1, fmt.Sprintf("Fetching release %d of %d: %s", i+1, len(albums), pa.Title))
 		if existingAlbum, _ := s.queries.FindAlbumByProvider(providerName, pa.Id); existingAlbum != nil {
+			_ = s.queries.UpdateAlbumMeta(existingAlbum.ID, pa.Title, intPtrOrNil(int(pa.Year)), strPtrOrNil(pa.CoverUrl), pa.RecordType)
 			if existingAlbum.Status != models.AlbumStatusIgnored {
 				s.syncAlbumTracks(ctx, providerName, existingAlbum)
 			}
 			continue
 		}
-		s.saveAlbumFromProvider(ctx, providerName, artistID, pa)
+		s.saveAlbumFromProviderWithOptions(ctx, providerName, artistID, pa, skipCache)
 	}
 	if len(albums) > 0 {
 		s.recordActivity("discography_synced", "artist", artistID,
@@ -483,7 +674,15 @@ func (s *Server) saveAlbumsFromProvider(providerName string, artistID int64, alb
 }
 
 func (s *Server) syncAlbumTracks(ctx context.Context, providerName string, album *models.Album) {
-	albumDetail, err := s.providers.GetAlbum(ctx, providerName, album.ProviderID)
+	existingTracks, _ := s.queries.ListTracksByAlbum(album.ID)
+	var albumDetail *pb.AlbumDetail
+	var err error
+	// Bypass cache if the album has 0 tracks so previously failed fetches heal immediately.
+	if len(existingTracks) == 0 {
+		albumDetail, err = s.providers.GetAlbumFresh(ctx, providerName, album.ProviderID)
+	} else {
+		albumDetail, err = s.providers.GetAlbum(ctx, providerName, album.ProviderID)
+	}
 	if err != nil {
 		return
 	}
@@ -505,6 +704,10 @@ func (s *Server) syncAlbumTracks(ctx context.Context, providerName string, album
 }
 
 func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string, artistID int64, pa *pb.AlbumSummary) {
+	s.saveAlbumFromProviderWithOptions(ctx, providerName, artistID, pa, false)
+}
+
+func (s *Server) saveAlbumFromProviderWithOptions(ctx context.Context, providerName string, artistID int64, pa *pb.AlbumSummary, skipCache bool) {
 	artist, _ := s.queries.GetArtist(artistID)
 	albumStatus := models.AlbumStatusWatched
 	trackStatus := models.TrackStatusWanted
@@ -517,8 +720,35 @@ func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string,
 		}
 	}
 
+	var albumDetail *pb.AlbumDetail
+	var err error
+	if skipCache {
+		albumDetail, err = s.providers.GetAlbumFresh(ctx, providerName, pa.Id)
+	} else {
+		albumDetail, err = s.providers.GetAlbum(ctx, providerName, pa.Id)
+	}
+	if err != nil {
+		slog.Warn("save album: fetch album detail failed", "artist_id", artistID, "album", pa.Title, "provider_id", pa.Id, "error", err)
+		return
+	}
+
+	if artist != nil && !language.IsAllLanguages(artist.Languages) && albumStatus == models.AlbumStatusWatched {
+		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
+		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+			albumStatus = models.AlbumStatusIgnored
+			trackStatus = models.TrackStatusIgnored
+		}
+	}
+
 	year := intPtrOrNil(int(pa.Year))
+	if year == nil && albumDetail.Year > 0 {
+		y := int(albumDetail.Year)
+		year = &y
+	}
 	cover := pa.CoverUrl
+	if cover == "" {
+		cover = albumDetail.CoverUrl
+	}
 	album := &models.Album{
 		ArtistID:   artistID,
 		Title:      pa.Title,
@@ -531,20 +761,6 @@ func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string,
 	}
 	if err := s.queries.CreateAlbum(album); err != nil {
 		return
-	}
-
-	albumDetail, err := s.providers.GetAlbum(ctx, providerName, pa.Id)
-	if err != nil {
-		return
-	}
-
-	if artist != nil && !language.IsAllLanguages(artist.Languages) && albumStatus == models.AlbumStatusWatched {
-		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
-		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
-			albumStatus = models.AlbumStatusIgnored
-			trackStatus = models.TrackStatusIgnored
-			_ = s.queries.UpdateAlbumStatus(album.ID, models.AlbumStatusIgnored)
-		}
 	}
 
 	for _, pt := range albumDetail.Tracks {
@@ -1242,14 +1458,27 @@ func (s *Server) handleRelinkEntity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
+		Provider   string `json:"provider"`
 		ProviderID string `json:"provider_id"`
+		Sync       bool   `json:"sync"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if strings.TrimSpace(req.ProviderID) == "" {
+		writeError(w, http.StatusBadRequest, "provider_id is required")
+		return
+	}
 
-	primary := s.providers.Primary()
+	targetProvider := strings.TrimSpace(req.Provider)
+	if targetProvider == "" {
+		targetProvider = s.providers.Primary()
+	}
+	if targetProvider == provider.LocalProvider || !s.providers.HasProvider(targetProvider) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid or unregistered provider %q", targetProvider))
+		return
+	}
 
 	path := r.URL.Path
 	var err2 error
@@ -1257,41 +1486,46 @@ func (s *Server) handleRelinkEntity(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(path, "/relink/artist/"):
 		// Capture the pre-relink provider: only promoting a local import runs the
-		// discography reconcile. A real→real swap stays a plain re-stamp.
+		// discography reconcile. A real->real swap stays a plain re-stamp unless sync=true.
 		prev, _ := s.queries.GetArtist(id)
-		if err2 = s.queries.RelinkArtist(id, primary, req.ProviderID); err2 == nil &&
-			prev != nil && prev.Provider == provider.LocalProvider {
-			_ = s.queries.UpdateArtistStatus(id, models.ArtistStatusWatched)
-			reconciling = true
-			providerID := req.ProviderID
-			s.startTask(
-				fmt.Sprintf("reconcile-artist-%d", id),
-				"reconcile_artist",
-				fmt.Sprintf("Linking library: %s", prev.Name),
-				"Fetching provider discography...",
-				0,
-				id,
-			)
-			s.bgWork.Add(1)
-			go func() {
-				defer s.bgWork.Done()
-				s.reconcileLocalArtist(primary, id, providerID)
-			}()
+		if err2 = s.queries.RelinkArtist(id, targetProvider, req.ProviderID); err2 == nil {
+			if prev != nil && prev.Provider == provider.LocalProvider {
+				_ = s.queries.UpdateArtistStatus(id, models.ArtistStatusWatched)
+				reconciling = true
+				providerID := req.ProviderID
+				s.startTask(
+					fmt.Sprintf("reconcile-artist-%d", id),
+					"reconcile_artist",
+					fmt.Sprintf("Linking library: %s", prev.Name),
+					"Fetching provider discography...",
+					0,
+					id,
+				)
+				s.bgWork.Add(1)
+				go func() {
+					defer s.bgWork.Done()
+					s.reconcileLocalArtist(targetProvider, id, providerID)
+				}()
+			} else if req.Sync {
+				if updated, err := s.queries.GetArtist(id); err == nil && updated != nil {
+					reconciling = s.syncArtistAsync(updated, true)
+				}
+			}
 		}
 	case strings.Contains(path, "/relink/album/"):
-		if err2 = s.queries.RelinkAlbum(id, primary, req.ProviderID); err2 == nil &&
+		if err2 = s.queries.RelinkAlbum(id, targetProvider, req.ProviderID); err2 == nil &&
 			s.albumHasLocalTracks(id) {
 			reconciling = true
 			albumID, providerID := id, req.ProviderID
 			s.bgWork.Add(1)
 			go func() {
 				defer s.bgWork.Done()
-				s.reconcileAlbumTracks(context.Background(), primary, albumID, providerID)
+				s.reconcileAlbumTracks(context.Background(), targetProvider, albumID, providerID)
 			}()
 		}
 	case strings.Contains(path, "/relink/track/"):
 		// A track is a leaf — nothing to reconcile beneath it.
-		err2 = s.queries.RelinkTrack(id, primary, req.ProviderID)
+		err2 = s.queries.RelinkTrack(id, targetProvider, req.ProviderID)
 	default:
 		writeError(w, http.StatusBadRequest, "invalid relink target")
 		return

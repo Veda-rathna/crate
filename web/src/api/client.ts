@@ -42,6 +42,10 @@ export const api = {
 
   listArtists: () => request<Artist[]>('/artists'),
   getArtist: (id: number) => request<Artist>(`/artists/${id}`),
+  syncArtist: (id: number) =>
+    request<{ status: string }>(`/artists/${id}/sync`, { method: 'POST' }),
+  syncAllArtists: () =>
+    request<{ status: string; started: number }>('/artists/sync', { method: 'POST' }),
   getAlbum: (id: number) => request<Album>(`/albums/${id}`),
 
   queueTrack: (id: number) =>
@@ -130,10 +134,19 @@ export const api = {
   listActivity: (limit = 50, offset = 0) =>
     request<ActivityResponse>(`/activity?limit=${limit}&offset=${offset}`),
   clearCache: () => request<void>('/cache', { method: 'DELETE' }),
-  relinkEntity: (type: 'artist' | 'album' | 'track', id: number, providerID: string) =>
+  relinkEntity: (
+    type: 'artist' | 'album' | 'track',
+    id: number,
+    providerID: string,
+    opts?: { provider?: string; sync?: boolean }
+  ) =>
     request<{ status: string; reconciling?: boolean }>(`/relink/${type}/${id}`, {
       method: 'POST',
-      body: JSON.stringify({ provider_id: providerID }),
+      body: JSON.stringify({
+        provider_id: providerID,
+        ...(opts?.provider ? { provider: opts.provider } : {}),
+        ...(opts?.sync !== undefined ? { sync: opts.sync } : {}),
+      }),
     }),
 
   // Manual link: merge a leftover local album into a linked sibling album, or

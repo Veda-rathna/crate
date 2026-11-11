@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
+	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
 
@@ -795,6 +796,21 @@ func (s *Server) lidarrCommand(w http.ResponseWriter, r *http.Request) {
 	name, _ := req["name"].(string)
 
 	switch name {
+	case "RefreshArtist":
+		if id, ok := lidarrCommandInt(req, "artistId"); ok {
+			if artist, err := s.queries.GetArtist(id); err == nil && artist != nil &&
+				artist.Provider != provider.LocalProvider && s.providers.HasProvider(artist.Provider) {
+				s.syncArtistAsync(artist, true)
+			}
+		} else if artists, err := s.queries.ListArtists(); err == nil {
+			for i := range artists {
+				a := &artists[i]
+				if a.Provider != provider.LocalProvider && s.providers.HasProvider(a.Provider) &&
+					(a.Status == models.ArtistStatusWatched || a.WatchNewReleases) {
+					s.syncArtistAsync(a, true)
+				}
+			}
+		}
 	case "ArtistSearch":
 		if id, ok := lidarrCommandInt(req, "artistId"); ok {
 			s.bgWork.Add(1)

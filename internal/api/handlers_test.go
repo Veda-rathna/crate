@@ -1527,13 +1527,25 @@ func TestBrowseAlbumWithProviderOverride(t *testing.T) {
 	}
 }
 
+func findAlbumByTitle(t *testing.T, albums []models.Album, title string) models.Album {
+	t.Helper()
+	for _, a := range albums {
+		if a.Title == title {
+			return a
+		}
+	}
+	t.Fatalf("album %q not found in %+v", title, albums)
+	return models.Album{}
+}
+
 func TestManualSearchTrack(t *testing.T) {
 	env := newTestEnv(t)
 	env.do("POST", "/api/watch/artist/1000", `{}`)
 
 	artists, _ := env.queries.ListArtists()
 	albums, _ := env.queries.ListAlbumsByArtist(artists[0].ID)
-	tracks, _ := env.queries.ListTracksByAlbum(albums[0].ID)
+	albumOne := findAlbumByTitle(t, albums, "Album One")
+	tracks, _ := env.queries.ListTracksByAlbum(albumOne.ID)
 
 	// Start search — returns search ID
 	w := env.do("POST", fmt.Sprintf("/api/tracks/%d/search", tracks[0].ID), "")
@@ -1622,7 +1634,8 @@ func TestManualSearchTrackEmptyBodyUsesDefault(t *testing.T) {
 
 	artists, _ := env.queries.ListArtists()
 	albums, _ := env.queries.ListAlbumsByArtist(artists[0].ID)
-	tracks, _ := env.queries.ListTracksByAlbum(albums[0].ID)
+	albumOne := findAlbumByTitle(t, albums, "Album One")
+	tracks, _ := env.queries.ListTracksByAlbum(albumOne.ID)
 
 	// Empty body — should use default "artist title" query
 	w := env.do("POST", fmt.Sprintf("/api/tracks/%d/search", tracks[0].ID), "")
@@ -2651,7 +2664,8 @@ func TestRejectTrackByName(t *testing.T) {
 
 	artists, _ := env.queries.ListArtists()
 	albums, _ := env.queries.ListAlbumsByArtist(artists[0].ID)
-	tracks, _ := env.queries.ListTracksByAlbum(albums[0].ID)
+	albumOne := findAlbumByTitle(t, albums, "Album One")
+	tracks, _ := env.queries.ListTracksByAlbum(albumOne.ID)
 
 	env.queries.UpdateTrackFilePath(tracks[0].ID, "Test Artist/Album One/01 Track A1.flac")
 	env.queries.UpdateTrackDownloadedFrom(tracks[0].ID, "someuser")
@@ -2740,5 +2754,247 @@ func TestStatusObservabilityAndTasks(t *testing.T) {
 	items := act["items"].([]any)
 	if len(items) < 2 {
 		t.Errorf("expected at least 2 activity items from watching artist, got %d", len(items))
+	}
+}
+
+type dynamicProvider struct {
+	pb.UnimplementedMusicProviderServer
+	mu         sync.Mutex
+	name       string
+	artistName string
+	artistImg  string
+	albums     []*pb.AlbumSummary
+	albumMap   map[string]*pb.AlbumDetail
+	failAlbum  map[string]bool
+}
+
+func (d *dynamicProvider) Info(ctx context.Context, req *pb.InfoRequest) (*pb.InfoResponse, error) {
+	return &pb.InfoResponse{Name: d.name, DisplayName: strings.ToUpper(d.name), Version: "1.0.0"}, nil
+}
+
+func (d *dynamicProvider) GetArtist(ctx context.Context, req *pb.EntityRequest) (*pb.ArtistDetail, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return &pb.ArtistDetail{Id: req.Id, Name: d.artistName, ImageUrl: d.artistImg}, nil
+}
+
+func (d *dynamicProvider) GetArtistAlbums(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumList, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]*pb.AlbumSummary, len(d.albums))
+	copy(out, d.albums)
+	return &pb.AlbumList{Albums: out}, nil
+}
+
+func (d *dynamicProvider) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumDetail, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failAlbum[req.Id] {
+		return nil, fmt.Errorf("transient error fetching %s", req.Id)
+	}
+	if detail, ok := d.albumMap[req.Id]; ok {
+		return detail, nil
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func startDynamicProvider(t *testing.T, dp *dynamicProvider) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterMusicProviderServer(s, dp)
+	go s.Serve(lis)
+	t.Cleanup(s.Stop)
+	return lis.Addr().String()
+}
+
+func newDynamicEnv(t *testing.T, providers map[string]*dynamicProvider, primary string) *testEnv {
+	t.Helper()
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	c, err := cache.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	actLog, err := activity.NewLog(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { actLog.Close() })
+
+	queries := db.NewQueries(database)
+	mgr := provider.NewManager(c, queries)
+	for name, dp := range providers {
+		dp.name = name
+		addr := startDynamicProvider(t, dp)
+		if err := mgr.RegisterProvider(context.Background(), name, addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = queries.SetSetting("provider_primary", primary)
+
+	fakeSlskd := newFakeSlskd()
+	t.Cleanup(fakeSlskd.Close)
+	slskdClient := slskd.NewClient(fakeSlskd.URL, "test-key")
+	dl := downloader.NewService(queries, slskdClient, &noopOrganizer{}, actLog)
+	srv := api.NewServer(queries, mgr, c, dl, actLog, nil, "/music", "test")
+
+	return &testEnv{server: srv, queries: queries, activityLog: actLog, fakeSlskd: fakeSlskd}
+}
+
+func TestSyncArtistBypassesCacheUpdatesMetaAndSkipsBrokenAlbums(t *testing.T) {
+	dp := &dynamicProvider{
+		artistName: "Initial Name",
+		artistImg:  "http://img/v1.jpg",
+		albums: []*pb.AlbumSummary{
+			{Id: "al-1", Title: "Album One", Year: 2023, RecordType: "album", Metadata: map[string]string{"release_date": "2023-05-01"}},
+			{Id: "al-fail", Title: "Broken Album", Year: 2024, RecordType: "album", Metadata: map[string]string{"release_date": "2024-01-01"}},
+		},
+		albumMap: map[string]*pb.AlbumDetail{
+			"al-1": {Id: "al-1", Title: "Album One", Year: 2023, Tracks: []*pb.TrackInfo{{Id: "t-1", Title: "T1", TrackNumber: 1, DiscNumber: 1}}},
+		},
+		failAlbum: map[string]bool{"al-fail": true},
+	}
+	env := newDynamicEnv(t, map[string]*dynamicProvider{"dyn": dp}, "dyn")
+
+	// Initial watch: caches discography; al-fail errors on GetAlbum and should NOT leave a 0-track album.
+	w := env.do("POST", "/api/watch/artist/art-1", `{}`)
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	artists, _ := env.queries.ListArtists()
+	albums, _ := env.queries.ListAlbumsByArtist(artists[0].ID)
+	if len(albums) != 1 {
+		t.Fatalf("expected 1 album (broken album skipped cleanly), got %d", len(albums))
+	}
+
+	// Now provider fixes al-fail, adds a brand-new 2026 album, and updates artist/album metadata.
+	dp.mu.Lock()
+	dp.artistName = "Updated Artist Name"
+	dp.artistImg = "http://img/v2.jpg"
+	dp.failAlbum["al-fail"] = false
+	dp.albums = append(dp.albums, &pb.AlbumSummary{
+		Id: "al-latest", Title: "Latest 2026", Year: 2026, RecordType: "album", Metadata: map[string]string{"release_date": "2026-11-11"},
+	})
+	dp.albums[0].Title = "Album One (Remastered)"
+	dp.albumMap["al-fail"] = &pb.AlbumDetail{Id: "al-fail", Title: "Broken Album", Year: 2024, Tracks: []*pb.TrackInfo{{Id: "t-fail", Title: "Fixed Track", TrackNumber: 1, DiscNumber: 1}}}
+	dp.albumMap["al-latest"] = &pb.AlbumDetail{Id: "al-latest", Title: "Latest 2026", Year: 2026, Tracks: []*pb.TrackInfo{{Id: "t-new", Title: "New Track", TrackNumber: 1, DiscNumber: 1}}}
+	dp.mu.Unlock()
+
+	// Sync should bypass cache and pick up latest album, fixed album, and updated artist/album metadata.
+	sw := env.do("POST", fmt.Sprintf("/api/artists/%d/sync", artists[0].ID), "")
+	if sw.Code != 202 {
+		t.Fatalf("expected 202 from sync, got %d: %s", sw.Code, sw.Body.String())
+	}
+
+	updatedArtist, _ := env.queries.GetArtist(artists[0].ID)
+	if updatedArtist.Name != "Updated Artist Name" {
+		t.Errorf("expected updated artist name, got %q", updatedArtist.Name)
+	}
+	if updatedArtist.ImageURL == nil || *updatedArtist.ImageURL != "http://img/v2.jpg" {
+		t.Errorf("expected updated artist image, got %v", updatedArtist.ImageURL)
+	}
+
+	albumsAfter, _ := env.queries.ListAlbumsByArtist(artists[0].ID)
+	if len(albumsAfter) != 3 {
+		t.Fatalf("expected 3 albums after sync, got %d", len(albumsAfter))
+	}
+	if albumsAfter[0].Title != "Latest 2026" {
+		t.Errorf("expected newest album 'Latest 2026' first, got %q", albumsAfter[0].Title)
+	}
+	alOne := findAlbumByTitle(t, albumsAfter, "Album One (Remastered)")
+	if alOne.ProviderID != "al-1" {
+		t.Errorf("unexpected album: %+v", alOne)
+	}
+
+	// Bulk sync endpoint also succeeds.
+	bw := env.do("POST", "/api/artists/sync", "")
+	if bw.Code != 202 {
+		t.Fatalf("expected 202 from bulk sync, got %d: %s", bw.Code, bw.Body.String())
+	}
+}
+
+func TestSyncPartialArtistDoesNotFloodBackCatalog(t *testing.T) {
+	dp := &dynamicProvider{
+		artistName: "Partial Artist",
+		albums: []*pb.AlbumSummary{
+			{Id: "al-old", Title: "Old Catalog", Year: 2015, RecordType: "album", Metadata: map[string]string{"release_date": "2015-01-01"}},
+			{Id: "al-same", Title: "Today Single", Year: 2026, RecordType: "single", Metadata: map[string]string{"release_date": "2026-11-11"}},
+		},
+		albumMap: map[string]*pb.AlbumDetail{
+			"al-old":  {Id: "al-old", Title: "Old Catalog", Year: 2015, Tracks: []*pb.TrackInfo{{Id: "t-old", Title: "Old", TrackNumber: 1, DiscNumber: 1}}},
+			"al-same": {Id: "al-same", Title: "Today Single", Year: 2026, Tracks: []*pb.TrackInfo{{Id: "t-same", Title: "Today", TrackNumber: 1, DiscNumber: 1}}},
+		},
+	}
+	env := newDynamicEnv(t, map[string]*dynamicProvider{"dyn": dp}, "dyn")
+
+	since := "2026-11-11T10:00:00Z"
+	artist := &models.Artist{
+		Name:                  "Partial Artist",
+		Provider:              "dyn",
+		ProviderID:            "art-p",
+		Status:                models.ArtistStatusPartial,
+		WatchNewReleases:      true,
+		WatchNewReleasesSince: &since,
+	}
+	if err := env.queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	w := env.do("POST", fmt.Sprintf("/api/artists/%d/sync", artist.ID), "")
+	if w.Code != 202 {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	albums, _ := env.queries.ListAlbumsByArtist(artist.ID)
+	if len(albums) != 1 || albums[0].ProviderID != "al-same" {
+		t.Fatalf("expected only same-day new release al-same (not old catalog), got %+v", albums)
+	}
+}
+
+func TestRelinkArtistHonorsExplicitProviderAndSyncs(t *testing.T) {
+	mb := &dynamicProvider{
+		artistName: "Artist MB",
+		albums:     []*pb.AlbumSummary{},
+		albumMap:   map[string]*pb.AlbumDetail{},
+	}
+	dz := &dynamicProvider{
+		artistName: "Artist Deezer",
+		albums: []*pb.AlbumSummary{
+			{Id: "dz-new", Title: "Latest on Deezer", Year: 2026, RecordType: "album", Metadata: map[string]string{"release_date": "2026-10-01"}},
+		},
+		albumMap: map[string]*pb.AlbumDetail{
+			"dz-new": {Id: "dz-new", Title: "Latest on Deezer", Year: 2026, Tracks: []*pb.TrackInfo{{Id: "dz-t1", Title: "Track 1", TrackNumber: 1, DiscNumber: 1}}},
+		},
+	}
+	env := newDynamicEnv(t, map[string]*dynamicProvider{"musicbrainz": mb, "deezer": dz}, "musicbrainz")
+
+	artist := &models.Artist{Name: "Artist MB", Provider: "musicbrainz", ProviderID: "mb-1", Status: models.ArtistStatusWatched}
+	if err := env.queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	w := env.do("POST", fmt.Sprintf("/api/relink/artist/%d", artist.ID), `{"provider":"deezer","provider_id":"dz-art-1","sync":true}`)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, _ := env.queries.GetArtist(artist.ID)
+	if got.Provider != "deezer" || got.ProviderID != "dz-art-1" {
+		t.Fatalf("expected relinked to deezer/dz-art-1, got %s/%s", got.Provider, got.ProviderID)
+	}
+	albums, _ := env.queries.ListAlbumsByArtist(artist.ID)
+	if len(albums) != 1 || albums[0].Provider != "deezer" || albums[0].ProviderID != "dz-new" {
+		t.Fatalf("expected deezer discography synced after relink, got %+v", albums)
 	}
 }

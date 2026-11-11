@@ -132,6 +132,13 @@ func (m *Manager) checkHealth(p *providerConn) bool {
 	return err == nil
 }
 
+func (m *Manager) HasProvider(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.providers[name]
+	return ok
+}
+
 func (m *Manager) getClient(name string) (pb.MusicProviderClient, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -210,12 +217,24 @@ func (m *Manager) SearchWithProvider(ctx context.Context, providerName, query st
 }
 
 func (m *Manager) GetArtist(ctx context.Context, providerName, id string) (*pb.ArtistDetail, error) {
+	return m.getArtist(ctx, providerName, id, false)
+}
+
+// GetArtistFresh fetches artist metadata directly from the provider, bypassing cache reads
+// while refreshing the cached entry on success.
+func (m *Manager) GetArtistFresh(ctx context.Context, providerName, id string) (*pb.ArtistDetail, error) {
+	return m.getArtist(ctx, providerName, id, true)
+}
+
+func (m *Manager) getArtist(ctx context.Context, providerName, id string, skipCache bool) (*pb.ArtistDetail, error) {
 	cacheKey := providerName + ":artist:" + id
 
-	if data, ok := m.cache.Get(cacheKey); ok {
-		var result pb.ArtistDetail
-		if json.Unmarshal(data, &result) == nil {
-			return &result, nil
+	if !skipCache {
+		if data, ok := m.cache.Get(cacheKey); ok {
+			var result pb.ArtistDetail
+			if json.Unmarshal(data, &result) == nil {
+				return &result, nil
+			}
 		}
 	}
 
@@ -237,12 +256,24 @@ func (m *Manager) GetArtist(ctx context.Context, providerName, id string) (*pb.A
 }
 
 func (m *Manager) GetArtistAlbums(ctx context.Context, providerName, id string) (*pb.AlbumList, error) {
+	return m.getArtistAlbums(ctx, providerName, id, false)
+}
+
+// GetArtistAlbumsFresh fetches the artist's discography directly from the provider,
+// bypassing cache reads while updating the cache when releases are returned.
+func (m *Manager) GetArtistAlbumsFresh(ctx context.Context, providerName, id string) (*pb.AlbumList, error) {
+	return m.getArtistAlbums(ctx, providerName, id, true)
+}
+
+func (m *Manager) getArtistAlbums(ctx context.Context, providerName, id string, skipCache bool) (*pb.AlbumList, error) {
 	cacheKey := providerName + ":artist-albums:" + id
 
-	if data, ok := m.cache.Get(cacheKey); ok {
-		var result pb.AlbumList
-		if json.Unmarshal(data, &result) == nil {
-			return &result, nil
+	if !skipCache {
+		if data, ok := m.cache.Get(cacheKey); ok {
+			var result pb.AlbumList
+			if json.Unmarshal(data, &result) == nil {
+				return &result, nil
+			}
 		}
 	}
 
@@ -256,20 +287,34 @@ func (m *Manager) GetArtistAlbums(ctx context.Context, providerName, id string) 
 		return nil, fmt.Errorf("get artist albums from %s: %w", providerName, err)
 	}
 
-	if data, err := json.Marshal(result); err == nil {
-		m.cache.Set(cacheKey, data, m.CacheTTL())
+	if len(result.Albums) > 0 {
+		if data, err := json.Marshal(result); err == nil {
+			m.cache.Set(cacheKey, data, m.CacheTTL())
+		}
 	}
 
 	return result, nil
 }
 
 func (m *Manager) GetAlbum(ctx context.Context, providerName, id string) (*pb.AlbumDetail, error) {
+	return m.getAlbum(ctx, providerName, id, false)
+}
+
+// GetAlbumFresh fetches album metadata and tracklist directly from the provider,
+// bypassing cache reads while updating the cache when tracks are returned.
+func (m *Manager) GetAlbumFresh(ctx context.Context, providerName, id string) (*pb.AlbumDetail, error) {
+	return m.getAlbum(ctx, providerName, id, true)
+}
+
+func (m *Manager) getAlbum(ctx context.Context, providerName, id string, skipCache bool) (*pb.AlbumDetail, error) {
 	cacheKey := providerName + ":album:" + id
 
-	if data, ok := m.cache.Get(cacheKey); ok {
-		var result pb.AlbumDetail
-		if json.Unmarshal(data, &result) == nil {
-			return &result, nil
+	if !skipCache {
+		if data, ok := m.cache.Get(cacheKey); ok {
+			var result pb.AlbumDetail
+			if json.Unmarshal(data, &result) == nil {
+				return &result, nil
+			}
 		}
 	}
 
@@ -283,8 +328,10 @@ func (m *Manager) GetAlbum(ctx context.Context, providerName, id string) (*pb.Al
 		return nil, fmt.Errorf("get album from %s: %w", providerName, err)
 	}
 
-	if data, err := json.Marshal(result); err == nil {
-		m.cache.Set(cacheKey, data, m.CacheTTL())
+	if len(result.Tracks) > 0 {
+		if data, err := json.Marshal(result); err == nil {
+			m.cache.Set(cacheKey, data, m.CacheTTL())
+		}
 	}
 
 	return result, nil

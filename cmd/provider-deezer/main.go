@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,10 +19,14 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
 
-const deezerBaseURL = "https://api.deezer.com"
+const (
+	deezerBaseURL   = "https://api.deezer.com"
+	maxArtistAlbums = 2000
+)
 
 type server struct {
 	pb.UnimplementedMusicProviderServer
@@ -152,36 +157,62 @@ func (s *server) GetArtist(ctx context.Context, req *pb.EntityRequest) (*pb.Arti
 }
 
 func (s *server) GetArtistAlbums(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumList, error) {
-	var resp struct {
-		Data []struct {
-			ID          int64  `json:"id"`
-			Title       string `json:"title"`
-			CoverMedium string `json:"cover_medium"`
-			ReleaseDate string `json:"release_date"`
-			RecordType  string `json:"record_type"`
-		} `json:"data"`
+	type deezerAlbum struct {
+		ID          int64  `json:"id"`
+		Title       string `json:"title"`
+		CoverMedium string `json:"cover_medium"`
+		ReleaseDate string `json:"release_date"`
+		RecordType  string `json:"record_type"`
 	}
 
-	if err := s.get(ctx, "/artist/"+req.Id+"/albums?limit=100", &resp); err != nil {
-		return nil, err
+	var allAlbums []deezerAlbum
+	seen := make(map[int64]bool)
+
+	for index := 0; ; {
+		var resp struct {
+			Data  []deezerAlbum `json:"data"`
+			Total int           `json:"total"`
+			Next  string        `json:"next"`
+		}
+
+		path := fmt.Sprintf("/artist/%s/albums?limit=100&index=%d", req.Id, index)
+		if err := s.get(ctx, path, &resp); err != nil {
+			return nil, err
+		}
+
+		for _, a := range resp.Data {
+			if seen[a.ID] {
+				continue
+			}
+			seen[a.ID] = true
+			allAlbums = append(allAlbums, a)
+		}
+
+		index += len(resp.Data)
+		if len(resp.Data) == 0 ||
+			(resp.Total > 0 && index >= resp.Total) ||
+			(resp.Next == "" && len(resp.Data) < 100) ||
+			len(allAlbums) >= maxArtistAlbums {
+			break
+		}
 	}
 
 	var albums []*pb.AlbumSummary
-	for i, a := range resp.Data {
-		year := parseYear(a.ReleaseDate)
+	for _, a := range allAlbums {
+		year := releasedate.ParseYear(a.ReleaseDate)
 		albums = append(albums, &pb.AlbumSummary{
 			Id:         strconv.FormatInt(a.ID, 10),
 			Title:      a.Title,
 			CoverUrl:   a.CoverMedium,
 			Year:       int32(year),
 			RecordType: a.RecordType,
-			Rank:       int32(len(resp.Data) - i),
 			Metadata: map[string]string{
 				"release_date": a.ReleaseDate,
 			},
 		})
 	}
 
+	releasedate.SortAlbumsDescending(albums)
 	return &pb.AlbumList{Albums: albums}, nil
 }
 
@@ -200,22 +231,36 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		return nil, err
 	}
 
-	var tracksResp struct {
-		Data []struct {
-			ID            int64  `json:"id"`
-			Title         string `json:"title"`
-			TrackPosition int    `json:"track_position"`
-			DiskNumber    int    `json:"disk_number"`
-			Duration      int    `json:"duration"`
-		} `json:"data"`
+	type deezerTrack struct {
+		ID            int64  `json:"id"`
+		Title         string `json:"title"`
+		TrackPosition int    `json:"track_position"`
+		DiskNumber    int    `json:"disk_number"`
+		Duration      int    `json:"duration"`
 	}
-	if err := s.get(ctx, "/album/"+req.Id+"/tracks", &tracksResp); err != nil {
-		return nil, err
+	var allTracks []deezerTrack
+	for index := 0; ; {
+		var tracksResp struct {
+			Data  []deezerTrack `json:"data"`
+			Total int           `json:"total"`
+			Next  string        `json:"next"`
+		}
+		if err := s.get(ctx, fmt.Sprintf("/album/%s/tracks?limit=100&index=%d", req.Id, index), &tracksResp); err != nil {
+			return nil, err
+		}
+		allTracks = append(allTracks, tracksResp.Data...)
+		index += len(tracksResp.Data)
+		if len(tracksResp.Data) == 0 ||
+			(tracksResp.Total > 0 && index >= tracksResp.Total) ||
+			(tracksResp.Next == "" && len(tracksResp.Data) < 100) ||
+			len(allTracks) >= maxArtistAlbums {
+			break
+		}
 	}
 
-	year := parseYear(albumResp.ReleaseDate)
+	year := releasedate.ParseYear(albumResp.ReleaseDate)
 	var tracks []*pb.TrackInfo
-	for _, t := range tracksResp.Data {
+	for _, t := range allTracks {
 		tracks = append(tracks, &pb.TrackInfo{
 			Id:          strconv.FormatInt(t.ID, 10),
 			Title:       t.Title,
@@ -286,7 +331,7 @@ func (s *server) SearchArtistTracks(ctx context.Context, req *pb.ArtistTrackSear
 			AlbumId:       strconv.FormatInt(t.Album.ID, 10),
 			AlbumTitle:    t.Album.Title,
 			AlbumCoverUrl: t.Album.CoverMedium,
-			AlbumYear:     int32(parseYear(t.Album.ReleaseDate)),
+			AlbumYear:     int32(releasedate.ParseYear(t.Album.ReleaseDate)),
 		})
 	}
 
@@ -309,13 +354,20 @@ func (s *server) get(ctx context.Context, path string, out any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("deezer API returned status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-func parseYear(dateStr string) int {
-	if len(dateStr) >= 4 {
-		y, _ := strconv.Atoi(dateStr[:4])
-		return y
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
 	}
-	return 0
+	// Deezer often reports quota/API errors with HTTP 200 and a JSON {"error": {...}} body.
+	var errEnv struct {
+		Error *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Code    int    `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errEnv) == nil && errEnv.Error != nil {
+		return fmt.Errorf("deezer API error (%s, code %d): %s", errEnv.Error.Type, errEnv.Error.Code, errEnv.Error.Message)
+	}
+	return json.Unmarshal(body, out)
 }

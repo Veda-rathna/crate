@@ -101,7 +101,9 @@ func (s *Server) setupRouter() chi.Router {
 
 		r.Route("/artists", func(r chi.Router) {
 			r.Get("/", s.handleListArtists)
+			r.Post("/sync", s.handleSyncAllArtists)
 			r.Get("/{id}", s.handleGetArtist)
+			r.Post("/{id}/sync", s.handleSyncArtist)
 			r.Put("/{id}/new-releases", s.handleToggleNewReleases)
 			r.Put("/{id}/languages", s.handleUpdateArtistLanguages)
 			r.Post("/{id}/queue", s.handleQueueArtistTracks)

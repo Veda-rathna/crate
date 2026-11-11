@@ -17,6 +17,7 @@ import {
   IconDisc,
   IconLibrary,
   IconLink,
+  IconRefresh,
   IconSearch,
   IconTrash,
 } from '../components/Icons';
@@ -132,8 +133,28 @@ export default function ArtistDetail() {
     onError: (err: Error) => toast(err.message, 'error'),
   });
 
+  const syncMetadata = useMutation({
+    mutationFn: () => api.syncArtist(artistIdNum),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      toast(
+        res.status === 'already_syncing'
+          ? 'Sync is already in progress'
+          : 'Syncing artist metadata & latest releases…',
+        res.status === 'already_syncing' ? 'info' : 'success'
+      );
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
   const relink = useMutation({
-    mutationFn: (providerID: string) => api.relinkEntity('artist', artistIdNum, providerID),
+    mutationFn: (providerID: string) =>
+      api.relinkEntity('artist', artistIdNum, providerID, {
+        provider: relinkProvider || undefined,
+        sync: true,
+      }),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['artist', id] });
       queryClient.invalidateQueries({ queryKey: ['artists'] });
@@ -143,7 +164,7 @@ export default function ArtistDetail() {
         lastAlbumCount.current = -1;
         reconcileTicks.current = 0;
         setReconciling(true);
-        toast('Linking — reconciling your files with provider discography…', 'success');
+        toast('Relinked — syncing provider discography…', 'success');
       } else {
         toast('Artist relinked', 'success');
       }
@@ -304,10 +325,28 @@ export default function ArtistDetail() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {artist.provider !== 'local' && (
+              <button
+                type="button"
+                onClick={() => syncMetadata.mutate()}
+                disabled={isSyncingOrReconciling || syncMetadata.isPending || artist.orphaned}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 transition-colors disabled:opacity-50"
+              >
+                <IconRefresh
+                  className={`w-3.5 h-3.5 ${isSyncingOrReconciling || syncMetadata.isPending ? 'animate-spin' : ''}`}
+                />
+                <span>{isSyncingOrReconciling ? 'Syncing…' : 'Sync Metadata'}</span>
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => setShowRelinkSearch(!showRelinkSearch)}
+              onClick={() => {
+                if (!showRelinkSearch && !relinkQuery) {
+                  setRelinkQuery(artist.name);
+                }
+                setShowRelinkSearch(!showRelinkSearch);
+              }}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 transition-colors"
             >
               <IconLink className="w-3.5 h-3.5" />

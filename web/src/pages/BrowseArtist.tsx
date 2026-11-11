@@ -14,7 +14,7 @@ export default function BrowseArtist() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { toast } = useToast();
-  const [watchNewReleases, setWatchNewReleases] = useState(false);
+  const [watchNewReleases, setWatchNewReleases] = useState(true);
   const [languages, setLanguages] = useState<string[]>([]);
   const [localWatchedAlbums, setLocalWatchedAlbums] = useState<Set<string>>(new Set());
   const [trackFilter, setTrackFilter] = useState('');

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"fmt"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
 
@@ -303,5 +304,104 @@ func TestMusicBrainzUserAgent(t *testing.T) {
 	_, _ = client.SearchArtists(context.Background(), &pb.SearchRequest{Query: "test"})
 	if receivedUA != "CrateTest/1.0" {
 		t.Errorf("expected User-Agent 'CrateTest/1.0', got %q", receivedUA)
+	}
+}
+
+func TestMusicBrainzGetArtistAlbumsPaginatesAndSortsNewestFirst(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/release-group", func(w http.ResponseWriter, r *http.Request) {
+		offset := r.URL.Query().Get("offset")
+		var items []map[string]any
+		if offset == "" || offset == "0" {
+			for i := 0; i < 100; i++ {
+				items = append(items, map[string]any{
+					"id":                 fmt.Sprintf("rg-%03d", i),
+					"title":              fmt.Sprintf("Album %03d", i),
+					"primary-type":       "Album",
+					"first-release-date": "2010-01-01",
+				})
+			}
+		} else if offset == "100" {
+			items = append(items, map[string]any{
+				"id":                 "rg-latest",
+				"title":              "Zebra Latest Album",
+				"primary-type":       "Album",
+				"first-release-date": "2026-10",
+			})
+			items = append(items, map[string]any{
+				"id":                 "rg-comp",
+				"title":              "Greatest Hits",
+				"primary-type":       "Album",
+				"secondary-types":    []string{"Compilation"},
+				"first-release-date": "2020",
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"release-group-count": 102,
+			"release-groups":      items,
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestServer(t, fake.URL)
+
+	resp, err := client.GetArtistAlbums(context.Background(), &pb.EntityRequest{Id: "artist-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Albums) != 102 {
+		t.Fatalf("expected 102 paginated albums, got %d", len(resp.Albums))
+	}
+	if resp.Albums[0].Id != "rg-latest" {
+		t.Errorf("expected newest album rg-latest first, got %q (%s)", resp.Albums[0].Id, resp.Albums[0].Title)
+	}
+	if resp.Albums[0].Year != 2026 {
+		t.Errorf("expected year 2026 for partial date 2026-10, got %d", resp.Albums[0].Year)
+	}
+	if resp.Albums[1].Id != "rg-comp" || resp.Albums[1].RecordType != "compilation" {
+		t.Errorf("expected rg-comp as compilation second, got %+v", resp.Albums[1])
+	}
+}
+
+func TestMusicBrainzGetAlbumPrefersOfficialRelease(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/release-group/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":                 "rg-1",
+			"title":              "Latest Album",
+			"first-release-date": "2026-05-01",
+			"releases": []map[string]any{
+				{"id": "rel-promo", "status": "Promotion"},
+				{"id": "rel-official", "status": "Official"},
+			},
+		})
+	})
+	mux.HandleFunc("/release/rel-promo", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"media": []any{}})
+	})
+	mux.HandleFunc("/release/rel-official", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"media": []map[string]any{
+				{
+					"position": 1,
+					"tracks": []map[string]any{
+						{"id": "t-1", "title": "Track One", "number": "1", "position": 1, "length": 180000},
+					},
+				},
+			},
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestServer(t, fake.URL)
+
+	resp, err := client.GetAlbum(context.Background(), &pb.EntityRequest{Id: "rg-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Tracks) != 1 || resp.Tracks[0].Id != "t-1" {
+		t.Fatalf("expected tracks from Official release, got %+v", resp.Tracks)
 	}
 }

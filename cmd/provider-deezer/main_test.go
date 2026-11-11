@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -179,17 +180,20 @@ func TestDeezerGetArtistAlbums(t *testing.T) {
 	if len(resp.Albums) != 2 {
 		t.Fatalf("expected 2 albums, got %d", len(resp.Albums))
 	}
-	if resp.Albums[0].Title != "OK Computer" {
-		t.Errorf("expected 'OK Computer', got %q", resp.Albums[0].Title)
+	if resp.Albums[0].Title != "Kid A" {
+		t.Errorf("expected newest album 'Kid A' first, got %q", resp.Albums[0].Title)
 	}
-	if resp.Albums[0].Year != 1997 {
-		t.Errorf("expected year 1997, got %d", resp.Albums[0].Year)
+	if resp.Albums[1].Title != "OK Computer" {
+		t.Errorf("expected 'OK Computer' second, got %q", resp.Albums[1].Title)
 	}
-	if resp.Albums[0].RecordType != "album" {
-		t.Errorf("expected record_type 'album', got %q", resp.Albums[0].RecordType)
+	if resp.Albums[1].Year != 1997 {
+		t.Errorf("expected year 1997, got %d", resp.Albums[1].Year)
 	}
-	if resp.Albums[0].Metadata["release_date"] != "1997-06-16" {
-		t.Errorf("expected release_date metadata, got %v", resp.Albums[0].Metadata)
+	if resp.Albums[1].RecordType != "album" {
+		t.Errorf("expected record_type 'album', got %q", resp.Albums[1].RecordType)
+	}
+	if resp.Albums[1].Metadata["release_date"] != "1997-06-16" {
+		t.Errorf("expected release_date metadata, got %v", resp.Albums[1].Metadata)
 	}
 }
 
@@ -237,5 +241,63 @@ func TestDeezerAPIError(t *testing.T) {
 	_, err := client.SearchArtists(context.Background(), &pb.SearchRequest{Query: "test"})
 	if err == nil {
 		t.Error("expected error for 500 response")
+	}
+}
+
+func TestDeezerGetArtistAlbumsPaginatesAndChecksJSONErrors(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/artist/1000/albums", func(w http.ResponseWriter, r *http.Request) {
+		index := r.URL.Query().Get("index")
+		var items []map[string]any
+		if index == "" || index == "0" {
+			for i := 0; i < 100; i++ {
+				items = append(items, map[string]any{
+					"id":           2000 + i,
+					"title":        fmt.Sprintf("Old Album %03d", i),
+					"release_date": "2010-01-01",
+					"record_type":  "album",
+				})
+			}
+		} else if index == "100" {
+			items = append(items, map[string]any{
+				"id":           9999,
+				"title":        "Brand New 2026 Album",
+				"release_date": "2026-11-01",
+				"record_type":  "album",
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data":  items,
+			"total": 101,
+		})
+	})
+	mux.HandleFunc("/artist/quota/albums", func(w http.ResponseWriter, r *http.Request) {
+		// Deezer quota errors return HTTP 200 with an error JSON object
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"type":    "QuotaException",
+				"message": "Quota limit exceeded",
+				"code":    4,
+			},
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestServer(t, fake.URL)
+
+	resp, err := client.GetArtistAlbums(context.Background(), &pb.EntityRequest{Id: "1000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Albums) != 101 {
+		t.Fatalf("expected 101 paginated albums, got %d", len(resp.Albums))
+	}
+	if resp.Albums[0].Id != "9999" {
+		t.Errorf("expected newest album 9999 first, got %q", resp.Albums[0].Id)
+	}
+
+	if _, err := client.GetArtistAlbums(context.Background(), &pb.EntityRequest{Id: "quota"}); err == nil {
+		t.Fatal("expected error for Deezer HTTP-200 JSON quota error payload")
 	}
 }

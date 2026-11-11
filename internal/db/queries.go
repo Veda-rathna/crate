@@ -114,8 +114,18 @@ func (q *Queries) SetArtistWatchNewReleases(id int64, enabled bool) error {
 		since = &ts
 	}
 	_, err := q.db.Exec(
-		`UPDATE artists SET watch_new_releases = ?, watch_new_releases_since = COALESCE(?, watch_new_releases_since), updated_at = ? WHERE id = ?`,
+		`UPDATE artists SET watch_new_releases = ?, watch_new_releases_since = COALESCE(watch_new_releases_since, ?), updated_at = ? WHERE id = ?`,
 		enabled, since, ts, id,
+	)
+	return err
+}
+
+func (q *Queries) UpdateArtistMeta(id int64, name string, imageURL *string) error {
+	_, err := q.db.Exec(
+		`UPDATE artists SET name = CASE WHEN ? <> '' THEN ? ELSE name END,
+		        image_url = COALESCE(?, image_url), updated_at = ?
+		 WHERE id = ?`,
+		name, name, imageURL, now(), id,
 	)
 	return err
 }
@@ -241,7 +251,7 @@ func (q *Queries) GetAlbum(id int64) (*models.Album, error) {
 func (q *Queries) ListAlbumsByArtist(artistID int64) ([]models.Album, error) {
 	rows, err := q.db.Query(
 		`SELECT id, artist_id, title, year, provider, provider_id, cover_url, record_type, status, created_at, updated_at
-		 FROM albums WHERE artist_id = ? ORDER BY year, title`, artistID,
+		 FROM albums WHERE artist_id = ? ORDER BY COALESCE(year, 0) DESC, title ASC`, artistID,
 	)
 	if err != nil {
 		return nil, err
@@ -258,6 +268,19 @@ func (q *Queries) ListAlbumsByArtist(artistID int64) ([]models.Album, error) {
 		albums = append(albums, a)
 	}
 	return albums, rows.Err()
+}
+
+func (q *Queries) UpdateAlbumMeta(id int64, title string, year *int, coverURL *string, recordType string) error {
+	_, err := q.db.Exec(
+		`UPDATE albums SET title = CASE WHEN ? <> '' THEN ? ELSE title END,
+		        year = COALESCE(?, year),
+		        cover_url = COALESCE(?, cover_url),
+		        record_type = CASE WHEN ? <> '' THEN ? ELSE record_type END,
+		        updated_at = ?
+		 WHERE id = ?`,
+		title, title, year, coverURL, recordType, recordType, now(), id,
+	)
+	return err
 }
 
 func (q *Queries) UpdateAlbumStatus(id int64, status models.AlbumStatus) error {
