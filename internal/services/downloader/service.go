@@ -127,6 +127,8 @@ func (s *Service) CancelTransfer(ctx context.Context, d *models.DownloadQueueIte
 }
 
 type ProgressItem struct {
+	DownloadID       int64   `json:"download_id,omitempty"`
+	TrackID          int64   `json:"track_id,omitempty"`
 	Username         string  `json:"username"`
 	Filename         string  `json:"filename"`
 	PercentComplete  float64 `json:"percent_complete"`
@@ -142,11 +144,11 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 		return nil, err
 	}
 
-	activeTransfers := make(map[string]bool)
+	activeTransfers := make(map[string]models.DownloadQueueItem)
 	downloading, _ := s.queries.ListDownloads("downloading")
 	for _, d := range downloading {
 		if d.SlskdSearchID != nil {
-			activeTransfers[*d.SlskdSearchID] = true
+			activeTransfers[*d.SlskdSearchID] = d
 		}
 	}
 
@@ -159,6 +161,8 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 				title = fmt.Sprintf("%s - %s", track.ArtistName, track.Title)
 			}
 			items = append(items, ProgressItem{
+				DownloadID:      d.ID,
+				TrackID:         d.TrackID,
 				Username:        "arcod (Direct FLAC)",
 				Filename:        title + ".flac",
 				PercentComplete: 50,
@@ -173,10 +177,13 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 					continue
 				}
 				transferKey := ud.Username + "|" + f.ID
-				if !activeTransfers[transferKey] {
+				dl, ok := activeTransfers[transferKey]
+				if !ok {
 					continue
 				}
 				items = append(items, ProgressItem{
+					DownloadID:       dl.ID,
+					TrackID:          dl.TrackID,
 					Username:         ud.Username,
 					Filename:         filepath.Base(f.Filename),
 					PercentComplete:  f.PercentComplete,
@@ -467,7 +474,10 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 
 	transfer, err := s.slskd.StartDownload(ctx, best.username, best.file.Filename, best.file.Size)
 	if err != nil {
-		s.queries.CooldownUser(best.username, "download failed: "+err.Error(), s.getCooldownDuration())
+		dur := s.getCooldownDuration()
+		s.queries.CooldownUser(best.username, "download failed: "+err.Error(), dur)
+		s.logActivity("user_cooldown", "track", track.ID,
+			fmt.Sprintf("Temporarily blocked peer %s (%s): %s", best.username, dur, err.Error()))
 		slog.Info("downloader: download start failed, shadow banning user", "username", best.username, "error", err)
 		return s.failWithRetry(d, err.Error())
 	}
@@ -615,6 +625,10 @@ func (s *Service) failWithRetry(d models.DownloadQueueItem, errMsg string) error
 	}
 	retryAt := time.Now().UTC().Add(backoff).Format(time.RFC3339)
 	slog.Info("downloader: scheduling retry", "download_id", d.ID, "attempts", d.Attempts, "retry_in", backoff)
+	if track, err := s.queries.GetTrackWithMeta(d.TrackID); err == nil && track != nil {
+		s.logActivity("retry_scheduled", "track", d.TrackID,
+			fmt.Sprintf("Scheduled retry %d/4 in %s for %s - %s: %s", d.Attempts+1, backoff, track.ArtistName, track.Title, errMsg))
+	}
 	return s.queries.ScheduleRetry(d.ID, retryAt, errMsg)
 }
 

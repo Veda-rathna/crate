@@ -60,6 +60,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ username, filename, size, bit_rate: bitRate }),
     }),
+  rejectTrack: (id: number) =>
+    request<{ status: string }>(`/tracks/${id}/reject`, {
+      method: 'POST',
+    }),
   queueArtistTracks: (id: number) =>
     request<{ queued: number }>(`/artists/${id}/queue`, { method: 'POST' }),
   queueAlbumTracks: (id: number) =>

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -26,6 +27,13 @@ import (
 // provider id and only gain newly-listed tracks, so it never duplicates.
 func (s *Server) reconcileLocalArtist(providerName string, artistID int64, artistProviderID string) {
 	ctx := context.Background()
+	taskID := fmt.Sprintf("reconcile-artist-%d", artistID)
+	artistName := fmt.Sprintf("Artist #%d", artistID)
+	if a, err := s.queries.GetArtist(artistID); err == nil && a != nil {
+		artistName = a.Name
+	}
+	s.startTask(taskID, "reconcile_artist", fmt.Sprintf("Linking library: %s", artistName), "Fetching provider discography...", 0, artistID)
+	defer s.finishTask(taskID)
 
 	albumList, err := s.providers.GetArtistAlbums(ctx, providerName, artistProviderID)
 	if err != nil {
@@ -54,7 +62,12 @@ func (s *Server) reconcileLocalArtist(providerName string, artistID int64, artis
 	}
 	used := make(map[int64]bool)
 
-	for _, pa := range albumList.Albums {
+	s.startTask(taskID, "reconcile_artist", fmt.Sprintf("Linking library: %s", artistName),
+		fmt.Sprintf("Matching %d local albums against %d releases...", len(locals), len(albumList.Albums)),
+		len(albumList.Albums), artistID)
+
+	for i, pa := range albumList.Albums {
+		s.updateTask(taskID, i+1, fmt.Sprintf("Reconciling %d of %d: %s", i+1, len(albumList.Albums), pa.Title))
 		if a, ok := linked[pa.Id]; ok {
 			// Already ours on this provider — fill any tracks it's newly listing.
 			s.reconcileAlbumTracks(ctx, providerName, a.ID, pa.Id)
@@ -73,6 +86,9 @@ func (s *Server) reconcileLocalArtist(providerName string, artistID int64, artis
 		s.saveAlbumFromProvider(ctx, providerName, artistID, pa)
 	}
 
+	s.recordActivity("artist_reconciled", "artist", artistID,
+		fmt.Sprintf("Linked %s to %s: matched %d of %d local albums across %d releases",
+			artistName, providerName, len(used), len(locals), len(albumList.Albums)))
 	slog.Info("reconcile: artist done", "artist_id", artistID, "provider", providerName,
 		"provider_albums", len(albumList.Albums), "local_albums", len(locals), "albums_matched", len(used))
 }

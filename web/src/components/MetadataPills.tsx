@@ -34,9 +34,12 @@ export default function MetadataPills({ metadata }: { metadata?: Record<string, 
   if (entries.length === 0) return null;
 
   return (
-    <div className="flex flex-wrap gap-1">
+    <div className="flex flex-wrap gap-1.5">
       {entries.map(({ key, value }) => (
-        <span key={key} className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded">
+        <span
+          key={key}
+          className="text-[11px] bg-zinc-800/80 border border-white/[0.06] text-zinc-300 px-2 py-0.5 rounded-md"
+        >
           {value}
         </span>
       ))}

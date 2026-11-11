@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
+import { useParams, useSearchParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
 import { useToast } from '../components/Toast';
 import MetadataPills from '../components/MetadataPills';
 import { formatDuration, formatTotalDuration } from '../lib/format';
+import { IconCheck, IconDisc } from '../components/Icons';
 import type { BrowseTrackResult } from '../types/index';
 
 export default function BrowseAlbum() {
@@ -30,13 +31,14 @@ export default function BrowseAlbum() {
     mutationFn: () =>
       api.watchAlbum(id!, {
         artist_provider_id: artistID,
-        artist_name: artistName,
+        artist_name: artistName || album?.artist_name || '',
         artist_image_url: artistImageURL,
         provider: providerOverride,
       }),
-    onSuccess: () => {
+    onSuccess: (created) => {
       queryClient.invalidateQueries({ queryKey: ['artists'] });
-      navigate('/');
+      toast(`Added "${created.title}" to library`, 'success');
+      navigate(`/album/${created.id}`);
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
@@ -45,7 +47,7 @@ export default function BrowseAlbum() {
     mutationFn: (track: BrowseTrackResult) =>
       api.watchTrack(track.id, {
         artist_provider_id: artistID,
-        artist_name: artistName,
+        artist_name: artistName || album?.artist_name || '',
         artist_image_url: artistImageURL,
         album_provider_id: id,
         album_title: album!.title,
@@ -60,95 +62,142 @@ export default function BrowseAlbum() {
     onSuccess: (_data, track) => {
       setLocalWatchedTracks((prev) => new Set(prev).add(track.id));
       queryClient.invalidateQueries({ queryKey: ['artists'] });
+      toast(`Watching "${track.title}"`, 'success');
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
 
   if (isLoading) {
     return (
-      <div className="animate-pulse">
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-14 h-14 rounded-lg bg-zinc-800" />
+      <div className="space-y-4 animate-pulse">
+        <div className="flex items-center gap-4">
+          <div className="w-20 h-20 rounded-2xl bg-zinc-800 shrink-0" />
           <div className="flex-1 space-y-2">
-            <div className="h-5 bg-zinc-800 rounded w-36" />
-            <div className="h-3 bg-zinc-800 rounded w-24" />
+            <div className="h-6 bg-zinc-800 rounded w-44" />
+            <div className="h-3.5 bg-zinc-800/70 rounded w-32" />
           </div>
         </div>
-        <div className="h-11 bg-zinc-800 rounded-lg mb-4" />
-        <div className="space-y-0">
+        <div className="h-11 bg-zinc-800 rounded-xl" />
+        <div className="space-y-1">
           {[...Array(8)].map((_, i) => (
-            <div key={i} className="flex items-center gap-2.5 px-2.5 py-2 h-12 border-b border-zinc-800/50" />
+            <div key={i} className="h-12 bg-zinc-900/60 rounded-xl" />
           ))}
         </div>
       </div>
     );
   }
 
-  if (!album) return <div className="text-zinc-500 text-sm py-8 text-center">Album not found</div>;
+  if (!album) {
+    return (
+      <div className="rounded-2xl bg-zinc-900/50 border border-white/[0.06] py-12 text-center text-zinc-400 text-sm">
+        Album not found
+      </div>
+    );
+  }
+
+  const totalDuration = album.tracks?.reduce((sum, t) => sum + t.duration_ms, 0) ?? 0;
 
   return (
-    <div>
-      <div className="flex items-center gap-3 mb-4">
-        <div className="w-14 h-14 rounded-lg bg-zinc-800 overflow-hidden shrink-0">
-          {album.cover_url ? (
-            <img src={album.cover_url} alt={album.title} className="w-full h-full object-cover" />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center text-zinc-600">
-              <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="12" cy="12" r="4" /><circle cx="12" cy="12" r="1" /></svg>
+    <div className="space-y-5">
+      {/* Album Hero */}
+      <div className="rounded-2xl bg-zinc-900/70 border border-white/[0.07] p-4 md:p-5">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+          <div className="flex items-center gap-4 flex-1 min-w-0">
+            <div className="w-20 h-20 md:w-24 md:h-24 rounded-xl bg-zinc-800 overflow-hidden shrink-0 border border-white/[0.08]">
+              {album.cover_url ? (
+                <img src={album.cover_url} alt={album.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-zinc-600">
+                  <IconDisc className="w-8 h-8" />
+                </div>
+              )}
             </div>
-          )}
-        </div>
-        <div className="flex-1 min-w-0">
-          <h2 className="text-lg font-bold truncate">{album.title}</h2>
-          <p className="text-xs text-zinc-500">
-            {album.artist_name || artistName}{album.year > 0 && ` · ${album.year}`} · {album.tracks?.length || 0} tracks
-            {album.tracks && album.tracks.length > 0 && ` · ${formatTotalDuration(album.tracks.reduce((sum, t) => sum + t.duration_ms, 0))}`}
-          </p>
-          {album.metadata && <div className="mt-1"><MetadataPills metadata={album.metadata} /></div>}
+            <div className="flex-1 min-w-0">
+              <h2 className="text-xl md:text-2xl font-bold tracking-tight text-zinc-100 truncate">
+                {album.title}
+              </h2>
+              <p className="text-xs text-zinc-400 mt-1">
+                {album.artist_name || artistName}
+                {album.year > 0 && ` · ${album.year}`} · {album.tracks?.length || 0} tracks
+                {totalDuration > 0 && ` · ${formatTotalDuration(totalDuration)}`}
+              </p>
+              {album.metadata && (
+                <div className="mt-2">
+                  <MetadataPills metadata={album.metadata} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            {album.library_id && (
+              <Link
+                to={`/album/${album.library_id}`}
+                className="px-4 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-xs font-medium text-zinc-200 transition-colors"
+              >
+                Open in Library
+              </Link>
+            )}
+            <button
+              type="button"
+              onClick={() => watchAlbum.mutate()}
+              disabled={watchAlbum.isPending || watchAlbum.isSuccess || album.album_watched}
+              className={`flex-1 sm:flex-initial px-5 py-2.5 rounded-xl font-semibold text-sm transition-all disabled:opacity-60 ${
+                album.album_watched || watchAlbum.isSuccess
+                  ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                  : 'bg-amber-400 hover:bg-amber-300 text-zinc-950 active:scale-[0.98]'
+              }`}
+            >
+              {album.album_watched || watchAlbum.isSuccess
+                ? '✓ Watching Album'
+                : watchAlbum.isPending
+                  ? 'Adding…'
+                  : 'Watch Entire Album'}
+            </button>
+          </div>
         </div>
       </div>
 
-      <button
-        onClick={() => watchAlbum.mutate()}
-        disabled={watchAlbum.isPending || watchAlbum.isSuccess || album.album_watched}
-        className={`w-full mb-4 py-2.5 rounded-lg font-semibold text-sm transition-transform disabled:opacity-50 ${
-          album.album_watched || watchAlbum.isSuccess
-            ? 'bg-green-900/50 text-green-400'
-            : 'bg-white text-zinc-900 active:scale-[0.98]'
-        }`}
-      >
-        {album.album_watched ? '✓ Watching Album' : watchAlbum.isSuccess ? '✓ Watching Album' : watchAlbum.isPending ? 'Adding...' : 'Watch Entire Album'}
-      </button>
-
+      {/* Tracks */}
       {album.tracks && album.tracks.length > 0 && (
-        <div>
-          <p className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-1.5">Tracks</p>
-          <div className="rounded-lg overflow-hidden">
+        <div className="space-y-2">
+          <p className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
+            Tracks ({album.tracks.length})
+          </p>
+          <div className="rounded-2xl bg-zinc-900/60 border border-white/[0.06] overflow-hidden divide-y divide-white/[0.05]">
             {album.tracks.map((track) => {
               const serverWatched = album.watched_track_ids?.includes(track.id);
               const isWatched = serverWatched || localWatchedTracks.has(track.id);
+              const isAdding =
+                watchTrack.isPending && watchTrack.variables?.id === track.id;
+
               return (
                 <div
                   key={track.id}
-                  className="flex items-center gap-2.5 px-2.5 py-2 border-b border-zinc-800/50 last:border-0"
+                  className="flex items-center gap-3 px-3.5 py-2.5 hover:bg-white/[0.02] transition-colors"
                 >
-                  <span className="text-[11px] text-zinc-600 w-5 text-right shrink-0 tabular-nums">
+                  <span className="text-xs text-zinc-500 w-6 text-right shrink-0 tabular-nums">
                     {track.track_number}
                   </span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm truncate">{track.title}</p>
-                    <p className="text-[11px] text-zinc-600 tabular-nums">{formatDuration(track.duration_ms)}</p>
+                    <p className="text-sm font-medium text-zinc-100 truncate">{track.title}</p>
+                    <p className="text-[11px] text-zinc-500 tabular-nums">
+                      {formatDuration(track.duration_ms)}
+                    </p>
                   </div>
                   {isWatched ? (
-                    <svg className="w-5 h-5 text-green-400 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="20 6 9 17 4 12" />
-                    </svg>
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/25 text-xs font-medium shrink-0">
+                      <IconCheck className="w-3.5 h-3.5" />
+                      Watched
+                    </span>
                   ) : (
                     <button
+                      type="button"
+                      disabled={isAdding}
                       onClick={() => watchTrack.mutate(track)}
-                      className="px-2.5 py-1 rounded text-xs font-medium transition-colors shrink-0 bg-zinc-700 text-zinc-200 active:bg-zinc-600"
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors shrink-0 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 disabled:opacity-50"
                     >
-                      Watch
+                      {isAdding ? 'Adding…' : 'Watch'}
                     </button>
                   )}
                 </div>
@@ -160,4 +209,3 @@ export default function BrowseAlbum() {
     </div>
   );
 }
-

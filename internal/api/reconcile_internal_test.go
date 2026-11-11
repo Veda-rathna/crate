@@ -149,3 +149,22 @@ func TestMatchLocalTrackRelaxed(t *testing.T) {
 		t.Errorf("expected studio Dreams not to match Dreams (Live), got %+v", got)
 	}
 }
+
+func TestTaskLifecycle(t *testing.T) {
+	s := &Server{}
+	s.startTask("t1", "sync_artist", "Syncing Test", "Starting...", 3, 42)
+	s.updateTask("t1", 2, "Album 2 of 3")
+
+	tasks := s.listTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	if tasks[0].Current != 2 || tasks[0].Total != 3 || tasks[0].Detail != "Album 2 of 3" {
+		t.Errorf("unexpected task state: %+v", tasks[0])
+	}
+
+	s.finishTask("t1")
+	if got := len(s.listTasks()); got != 0 {
+		t.Errorf("expected 0 tasks after finish, got %d", got)
+	}
+}

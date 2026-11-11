@@ -19,7 +19,6 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
   const [showAddCustom, setShowAddCustom] = useState(false);
   const [customInput, setCustomInput] = useState('');
 
-  // Normalize selected list (lowercase, trimmed)
   const normalizedSelected = (selected || [])
     .map((l) => l.toLowerCase().trim())
     .filter(Boolean);
@@ -62,7 +61,6 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
     setShowAddCustom(false);
   };
 
-  // Find any selected languages not present in presets
   const presetIds = new Set(PRESET_LANGUAGES.map((p) => p.id));
   const customSelected = normalizedSelected.filter((l) => l !== 'all' && !presetIds.has(l));
 
@@ -73,35 +71,31 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
   };
 
   return (
-    <div className="bg-zinc-800/50 rounded-lg p-3 space-y-2">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-sm font-medium">Language Preference</p>
-          <p className="text-[11px] text-zinc-500">
-            {isAll
-              ? 'Auto-downloads releases in all languages'
-              : `Only auto-downloads in: ${normalizedSelected.map(formatLangName).join(', ')}`}
-          </p>
-        </div>
+    <div className="bg-zinc-900/70 border border-white/[0.06] rounded-xl p-3.5 space-y-2.5">
+      <div>
+        <p className="text-sm font-medium text-zinc-100">Language Filter</p>
+        <p className="text-[11px] text-zinc-400 mt-0.5">
+          {isAll
+            ? 'Auto-downloads releases in all languages'
+            : `Only auto-downloads releases in: ${normalizedSelected.map(formatLangName).join(', ')}`}
+        </p>
       </div>
 
-      <div className="flex flex-wrap gap-1.5 pt-1">
-        {/* "All Languages" button */}
+      <div className="flex flex-wrap gap-1.5">
         <button
           type="button"
           disabled={disabled}
           onClick={() => handleToggle('all')}
           className={`px-2.5 py-1 text-xs rounded-full font-medium transition-all ${
             isAll
-              ? 'bg-green-900/60 text-green-300 border border-green-700/70 shadow-sm'
-              : 'bg-zinc-800 text-zinc-400 border border-zinc-700/40 hover:border-zinc-600 active:scale-95'
+              ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/35'
+              : 'bg-zinc-800/80 text-zinc-400 border border-white/[0.06] hover:border-white/[0.14] active:scale-95'
           } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
         >
           {isAll && <span className="mr-1">✓</span>}
           All Languages
         </button>
 
-        {/* Preset languages */}
         {PRESET_LANGUAGES.map(({ id, label }) => {
           const active = !isAll && normalizedSelected.includes(id);
           return (
@@ -112,8 +106,8 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
               onClick={() => handleToggle(id)}
               className={`px-2.5 py-1 text-xs rounded-full font-medium transition-all ${
                 active
-                  ? 'bg-green-900/60 text-green-300 border border-green-700/70 shadow-sm'
-                  : 'bg-zinc-800 text-zinc-400 border border-zinc-700/40 hover:border-zinc-600 active:scale-95'
+                  ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/35'
+                  : 'bg-zinc-800/80 text-zinc-400 border border-white/[0.06] hover:border-white/[0.14] active:scale-95'
               } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               {active && <span className="mr-1">✓</span>}
@@ -122,27 +116,25 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
           );
         })}
 
-        {/* Custom languages */}
         {customSelected.map((lang) => (
           <button
             key={lang}
             type="button"
             disabled={disabled}
             onClick={() => handleToggle(lang)}
-            className={`px-2.5 py-1 text-xs rounded-full font-medium transition-all bg-green-900/60 text-green-300 border border-green-700/70 ${
+            className={`px-2.5 py-1 text-xs rounded-full font-medium transition-all bg-emerald-500/15 text-emerald-300 border border-emerald-500/35 ${
               disabled ? 'opacity-50 cursor-not-allowed' : 'active:scale-95'
             }`}
           >
             <span className="mr-1">✓</span>
             {formatLangName(lang)}
-            <span className="ml-1 text-[10px] text-green-400/80 hover:text-white">✕</span>
+            <span className="ml-1 text-[10px] opacity-75">✕</span>
           </button>
         ))}
 
-        {/* Add custom language button/input */}
-        {!disabled && (
-          showAddCustom ? (
-            <div className="inline-flex items-center gap-1">
+        {!disabled &&
+          (showAddCustom ? (
+            <div className="inline-flex items-center gap-1.5">
               <input
                 type="text"
                 value={customInput}
@@ -157,13 +149,13 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
                   }
                 }}
                 placeholder="e.g. Punjabi"
-                className="bg-zinc-900 border border-zinc-700 rounded-full px-2.5 py-0.5 text-xs text-zinc-200 placeholder-zinc-500 outline-none focus:border-green-600 w-24"
+                className="bg-zinc-950 border border-white/[0.12] rounded-full px-3 py-1 text-xs text-zinc-100 placeholder-zinc-500 outline-none focus:border-emerald-500/50 w-28"
                 autoFocus
               />
               <button
                 type="button"
                 onClick={handleAddCustom}
-                className="text-xs text-green-400 hover:text-green-300 px-1"
+                className="text-xs font-medium text-emerald-400 hover:text-emerald-300 px-1.5"
               >
                 Add
               </button>
@@ -182,14 +174,12 @@ export default function LanguageSelector({ selected, onChange, disabled }: Langu
             <button
               type="button"
               onClick={() => setShowAddCustom(true)}
-              className="px-2 py-1 text-xs rounded-full text-zinc-500 border border-dashed border-zinc-700 hover:text-zinc-300 hover:border-zinc-500"
+              className="px-2.5 py-1 text-xs rounded-full text-zinc-400 border border-dashed border-zinc-700 hover:text-zinc-200 hover:border-zinc-500 transition-colors"
             >
               + Other
             </button>
-          )
-        )}
+          ))}
       </div>
     </div>
   );
 }
-

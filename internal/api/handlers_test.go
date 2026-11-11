@@ -2710,3 +2710,35 @@ func TestRejectTrackDeletesFile(t *testing.T) {
 		t.Error("expected file to be deleted after reject")
 	}
 }
+
+func TestStatusObservabilityAndTasks(t *testing.T) {
+	env := newTestEnv(t)
+	env.do("POST", "/api/watch/artist/1000", `{}`)
+	env.do("POST", "/api/downloads/queue", "")
+
+	w := env.do("GET", "/api/status", "")
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	status := decode[map[string]any](t, w)
+	if int(status["wanted_tracks"].(float64)) != 3 {
+		t.Errorf("expected 3 wanted_tracks, got %v", status["wanted_tracks"])
+	}
+	if _, ok := status["import_status"].(map[string]any); !ok {
+		t.Errorf("expected import_status object, got %T", status["import_status"])
+	}
+	if _, ok := status["active_tasks"].([]any); !ok {
+		t.Errorf("expected active_tasks array, got %T", status["active_tasks"])
+	}
+
+	// Watching an artist should have recorded artist_watched + discography_synced activity.
+	actW := env.do("GET", "/api/activity?limit=10&offset=0", "")
+	if actW.Code != 200 {
+		t.Fatalf("expected 200 from activity, got %d", actW.Code)
+	}
+	act := decode[map[string]any](t, actW)
+	items := act["items"].([]any)
+	if len(items) < 2 {
+		t.Errorf("expected at least 2 activity items from watching artist, got %d", len(items))
+	}
+}

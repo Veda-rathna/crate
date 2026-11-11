@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -151,6 +152,8 @@ func (s *Service) detectNewReleases(ctx context.Context) {
 		}
 		if added > 0 {
 			slog.Info("scheduler: new releases", "artist", artist.Name, "albums", added)
+			s.recordActivity("new_releases", "artist", artist.ID,
+				fmt.Sprintf("Detected %d new release(s) for %s", added, artist.Name))
 		}
 	}
 }
@@ -196,6 +199,8 @@ func (s *Service) queueWantedTracks() {
 	}
 	if queued > 0 {
 		slog.Info("scheduler: queued wanted tracks", "count", queued, "limit", maxQueue, "cooldown_days", cooldownDays)
+		s.recordActivity("auto_queued", "library", 0,
+			fmt.Sprintf("Scheduler queued %d wanted track(s)", queued))
 	}
 }
 
@@ -221,6 +226,8 @@ func (s *Service) checkFileIntegrity() {
 	}
 	if reverted > 0 {
 		slog.Info("scheduler: file integrity check", "reverted", reverted)
+		s.recordActivity("file_missing", "library", 0,
+			fmt.Sprintf("Integrity check: %d missing track file(s) reverted to wanted", reverted))
 	}
 }
 
@@ -272,6 +279,14 @@ func (s *Service) scanForUpgrades() {
 	}
 	if queued > 0 {
 		slog.Info("scheduler: queued upgrades", "artist", artist.Name, "tracks", queued)
+		s.recordActivity("upgrade_queued", "artist", artist.ID,
+			fmt.Sprintf("Quality upgrade check queued %d track(s) for %s", queued, artist.Name))
+	}
+}
+
+func (s *Service) recordActivity(action, entityType string, entityID int64, details string) {
+	if s.activityLog != nil {
+		s.activityLog.Record(action, entityType, entityID, details)
 	}
 }
 

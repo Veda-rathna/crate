@@ -26,37 +26,43 @@ export default function AlphabetRail({ activeLetters }: AlphabetRailProps) {
     return LETTERS[Math.max(0, Math.min(idx, LETTERS.length - 1))];
   }, []);
 
-  const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    setDragging(true);
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    const letter = getLetterFromY(e.clientY);
-    if (letter && activeLetters.has(letter)) {
-      setHoveredLetter(letter);
-      scrollToLetter(letter);
-    }
-  }, [activeLetters, getLetterFromY, scrollToLetter]);
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      setDragging(true);
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      const letter = getLetterFromY(e.clientY);
+      if (letter && activeLetters.has(letter)) {
+        setHoveredLetter(letter);
+        scrollToLetter(letter);
+      }
+    },
+    [activeLetters, getLetterFromY, scrollToLetter]
+  );
 
-  const handlePointerMove = useCallback((e: React.PointerEvent) => {
-    if (!dragging) return;
-    const letter = getLetterFromY(e.clientY);
-    if (letter && activeLetters.has(letter) && letter !== hoveredLetter) {
-      setHoveredLetter(letter);
-      scrollToLetter(letter);
-    }
-  }, [dragging, activeLetters, getLetterFromY, hoveredLetter, scrollToLetter]);
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (!dragging) return;
+      const letter = getLetterFromY(e.clientY);
+      if (letter && activeLetters.has(letter) && letter !== hoveredLetter) {
+        setHoveredLetter(letter);
+        scrollToLetter(letter);
+      }
+    },
+    [dragging, activeLetters, getLetterFromY, hoveredLetter, scrollToLetter]
+  );
 
   const handlePointerUp = useCallback(() => {
     setDragging(false);
     setHoveredLetter(null);
   }, []);
 
-  if (activeLetters.size <= 1) return null;
+  if (activeLetters.size <= 2) return null;
 
   return (
     <>
       <div
         ref={railRef}
-        className="fixed right-1 top-1/2 -translate-y-1/2 z-40 flex flex-col items-center select-none touch-none md:right-[max(0.25rem,calc(50vw-39rem))]"
+        className="fixed right-1 top-1/2 -translate-y-1/2 z-30 flex flex-col items-center select-none touch-none py-1 px-0.5 rounded-full bg-zinc-900/60 backdrop-blur-xs border border-white/[0.06] md:right-3"
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -68,13 +74,14 @@ export default function AlphabetRail({ activeLetters }: AlphabetRailProps) {
           return (
             <button
               key={letter}
+              type="button"
               onClick={() => isActive && scrollToLetter(letter)}
-              className={`w-5 h-[14px] flex items-center justify-center text-[9px] font-medium leading-none rounded-sm transition-colors ${
+              className={`w-5 h-[14px] flex items-center justify-center text-[9px] font-semibold leading-none rounded-sm transition-colors ${
                 isHovered
-                  ? 'text-white bg-zinc-700'
+                  ? 'text-zinc-950 bg-amber-400'
                   : isActive
-                    ? 'text-zinc-300'
-                    : 'text-zinc-700/50'
+                    ? 'text-zinc-300 hover:text-amber-300'
+                    : 'text-zinc-700/60'
               }`}
               disabled={!isActive}
               tabIndex={-1}
@@ -86,8 +93,8 @@ export default function AlphabetRail({ activeLetters }: AlphabetRailProps) {
       </div>
 
       {dragging && hoveredLetter && (
-        <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-zinc-800 rounded-xl w-16 h-16 flex items-center justify-center pointer-events-none">
-          <span className="text-3xl font-bold text-white">{hoveredLetter}</span>
+        <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-zinc-900/95 border border-white/[0.1] shadow-2xl rounded-2xl w-16 h-16 flex items-center justify-center pointer-events-none">
+          <span className="text-3xl font-bold text-amber-400">{hoveredLetter}</span>
         </div>
       )}
     </>

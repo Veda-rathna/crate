@@ -31,6 +31,8 @@ type Server struct {
 	router      chi.Router
 	frontendFS  fs.FS
 	bgWork      sync.WaitGroup
+	tasksMu     sync.Mutex
+	tasks       map[string]*BackgroundTask
 	startTime   time.Time
 	libraryDir  string
 	version     string
@@ -46,6 +48,7 @@ func NewServer(queries *db.Queries, providers *provider.Manager, c *cache.Cache,
 		importer:    importer.NewService(queries, libraryDir, actLog),
 		reject:      reject.NewService(queries, libraryDir, actLog),
 		frontendFS:  frontendFS,
+		tasks:       make(map[string]*BackgroundTask),
 		startTime:   time.Now().UTC(),
 		libraryDir:  libraryDir,
 		version:     version,

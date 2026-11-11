@@ -1,15 +1,18 @@
 import { useState, useEffect, useRef } from 'react';
+import { IconClose, IconSearch } from './Icons';
 
 export default function FilterBar({
   value,
   onChange,
   placeholder = 'Filter...',
   debounceMs = 0,
+  className = 'mb-3',
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   debounceMs?: number;
+  className?: string;
 }) {
   const [local, setLocal] = useState(value);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -31,25 +34,23 @@ export default function FilterBar({
   useEffect(() => () => clearTimeout(timerRef.current), []);
 
   return (
-    <div className="relative mb-3">
-      <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500 pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" />
-      </svg>
+    <div className={`relative ${className}`}>
+      <IconSearch className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
       <input
         type="text"
         value={local}
         onChange={(e) => handleChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full bg-zinc-800/60 rounded-lg pl-8 pr-8 py-2 text-sm placeholder-zinc-600 outline-none focus:ring-2 focus:ring-zinc-600"
+        className="w-full bg-zinc-900/80 border border-white/[0.08] rounded-xl pl-10 pr-9 py-2.5 text-base md:text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/20 transition-all"
       />
       {local && (
         <button
+          type="button"
           onClick={() => handleChange('')}
-          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-500 active:text-zinc-300"
+          aria-label="Clear filter"
+          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-zinc-500 hover:text-zinc-200 transition-colors"
         >
-          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M18 6 6 18" /><path d="m6 6 12 12" />
-          </svg>
+          <IconClose className="w-3.5 h-3.5" />
         </button>
       )}
     </div>

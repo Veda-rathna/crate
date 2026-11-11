@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback, useRef, type ReactNode } from 'react';
+import { IconAlert, IconCheck, IconClose } from './Icons';
 
 interface Toast {
   id: number;
@@ -22,29 +23,43 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const toast = useCallback((message: string, type: Toast['type'] = 'info') => {
     const id = nextId.current++;
-    setToasts((prev) => [...prev, { id, message, type }]);
+    setToasts((prev) => [...prev.slice(-3), { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4000);
+    }, 4500);
+  }, []);
+
+  const dismiss = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((x) => x.id !== id));
   }, []);
 
   return (
     <ToastContext.Provider value={{ toast }}>
       {children}
-      <div className="fixed top-4 right-4 z-[100] flex flex-col gap-2 max-w-sm">
+      <div className="fixed bottom-20 left-4 right-4 md:bottom-auto md:top-5 md:right-5 md:left-auto z-[100] flex flex-col gap-2 md:w-full md:max-w-sm pointer-events-none">
         {toasts.map((t) => (
           <div
             key={t.id}
-            className={`px-4 py-3 rounded-lg text-sm font-medium shadow-lg animate-fade-in ${
+            role="status"
+            className={`pointer-events-auto flex items-center gap-2.5 px-3.5 py-3 rounded-xl text-sm font-medium shadow-xl backdrop-blur-md border animate-fade-in ${
               t.type === 'error'
-                ? 'bg-red-900/90 text-red-200 border border-red-800'
+                ? 'bg-rose-950/90 text-rose-200 border-rose-500/35'
                 : t.type === 'success'
-                  ? 'bg-green-900/90 text-green-200 border border-green-800'
-                  : 'bg-zinc-800/90 text-zinc-200 border border-zinc-700'
+                  ? 'bg-emerald-950/90 text-emerald-200 border-emerald-500/35'
+                  : 'bg-zinc-900/95 text-zinc-100 border-white/[0.12]'
             }`}
-            onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
           >
-            {t.message}
+            {t.type === 'success' && <IconCheck className="w-4 h-4 text-emerald-400 shrink-0" />}
+            {t.type === 'error' && <IconAlert className="w-4 h-4 text-rose-400 shrink-0" />}
+            <span className="flex-1 leading-snug">{t.message}</span>
+            <button
+              type="button"
+              onClick={() => dismiss(t.id)}
+              className="text-current opacity-60 hover:opacity-100 p-0.5 rounded transition-opacity shrink-0"
+              aria-label="Dismiss notification"
+            >
+              <IconClose className="w-3.5 h-3.5" />
+            </button>
           </div>
         ))}
       </div>

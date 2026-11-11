@@ -106,6 +106,7 @@ export interface BrowseAlbumDetail {
   metadata?: Record<string, string>;
   album_watched?: boolean;
   watched_track_ids?: string[];
+  library_id?: number;
 }
 
 export interface BrowseTrackResult {
@@ -119,6 +120,8 @@ export interface BrowseTrackResult {
 }
 
 export interface DownloadProgress {
+  download_id?: number;
+  track_id?: number;
   username: string;
   filename: string;
   percent_complete: number;
@@ -128,14 +131,36 @@ export interface DownloadProgress {
   state: string;
 }
 
+export interface BackgroundTask {
+  id: string;
+  kind: 'sync_artist' | 'reconcile_artist' | string;
+  title: string;
+  detail: string;
+  current: number;
+  total: number;
+  entity_id: number;
+  started_at: string;
+}
+
 export interface SystemStatus {
   status: string;
   version?: string;
   artists_count: number;
   total_tracks?: number;
   owned_tracks?: number;
+  wanted_tracks?: number;
   pending_downloads: number;
   active_downloads: number;
+  searching_downloads?: number;
+  downloading_downloads?: number;
+  organizing_downloads?: number;
+  failed_downloads?: number;
+  complete_downloads?: number;
+  unlinked_artists?: number;
+  orphaned_artists?: number;
+  unhealthy_providers?: number;
+  import_status?: ImportState;
+  active_tasks?: BackgroundTask[];
 }
 
 export interface SearchResponse {

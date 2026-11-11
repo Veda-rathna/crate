@@ -37,38 +37,143 @@ func parseID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 }
 
-// Status
+// Status & Background Task Tracking
+
+type BackgroundTask struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	Title     string `json:"title"`
+	Detail    string `json:"detail"`
+	Current   int    `json:"current"`
+	Total     int    `json:"total"`
+	EntityID  int64  `json:"entity_id"`
+	StartedAt string `json:"started_at"`
+}
+
+func (s *Server) startTask(id, kind, title, detail string, total int, entityID int64) {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	if s.tasks == nil {
+		s.tasks = make(map[string]*BackgroundTask)
+	}
+	s.tasks[id] = &BackgroundTask{
+		ID:        id,
+		Kind:      kind,
+		Title:     title,
+		Detail:    detail,
+		Total:     total,
+		EntityID:  entityID,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (s *Server) updateTask(id string, current int, detail string) {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	if t, ok := s.tasks[id]; ok {
+		t.Current = current
+		if detail != "" {
+			t.Detail = detail
+		}
+	}
+}
+
+func (s *Server) finishTask(id string) {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	delete(s.tasks, id)
+}
+
+func (s *Server) listTasks() []BackgroundTask {
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+	out := make([]BackgroundTask, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		out = append(out, *t)
+	}
+	return out
+}
+
+func (s *Server) recordActivity(action, entityType string, entityID int64, details string) {
+	if s.activityLog != nil {
+		s.activityLog.Record(action, entityType, entityID, details)
+	}
+}
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	artists, _ := s.queries.ListArtists()
 	downloads, _ := s.queries.ListDownloads("")
+	wanted, _ := s.queries.ListWantedTracks()
 
 	pending := 0
-	active := 0
+	searching := 0
+	downloading := 0
+	organizing := 0
+	failed := 0
+	complete := 0
 	for _, d := range downloads {
 		switch d.Status {
-		case "pending":
+		case models.DownloadStatusPending:
 			pending++
-		case "searching", "downloading":
-			active++
+		case models.DownloadStatusSearching:
+			searching++
+		case models.DownloadStatusDownloading:
+			downloading++
+		case models.DownloadStatusOrganizing:
+			organizing++
+		case models.DownloadStatusFailed:
+			failed++
+		case models.DownloadStatusComplete:
+			complete++
 		}
 	}
+	active := searching + downloading
 
 	totalTracks := 0
 	ownedTracks := 0
+	unlinkedArtists := 0
+	orphanedArtists := 0
+	healthCache := make(map[string]bool)
 	for _, a := range artists {
 		totalTracks += a.TotalTracks
 		ownedTracks += a.OwnedTracks
+		if a.Provider == provider.LocalProvider {
+			unlinkedArtists++
+		}
+		if _, ok := healthCache[a.Provider]; !ok {
+			healthCache[a.Provider] = s.providers.IsHealthy(a.Provider)
+		}
+		if !healthCache[a.Provider] {
+			orphanedArtists++
+		}
+	}
+
+	unhealthyProviders := 0
+	for _, p := range s.providers.ListProviders() {
+		if !p.Healthy {
+			unhealthyProviders++
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":            "ok",
-		"version":           s.version,
-		"artists_count":     len(artists),
-		"total_tracks":      totalTracks,
-		"owned_tracks":      ownedTracks,
-		"pending_downloads": pending,
-		"active_downloads":  active,
+		"status":                "ok",
+		"version":               s.version,
+		"artists_count":         len(artists),
+		"total_tracks":          totalTracks,
+		"owned_tracks":          ownedTracks,
+		"wanted_tracks":         len(wanted),
+		"pending_downloads":     pending,
+		"active_downloads":      active,
+		"searching_downloads":   searching,
+		"downloading_downloads": downloading,
+		"organizing_downloads":  organizing,
+		"failed_downloads":      failed,
+		"complete_downloads":    complete,
+		"unlinked_artists":      unlinkedArtists,
+		"orphaned_artists":      orphanedArtists,
+		"unhealthy_providers":   unhealthyProviders,
+		"import_status":         s.importer.Status(),
+		"active_tasks":          s.listTasks(),
 	})
 }
 
@@ -292,6 +397,16 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 		}
 
 		albums := albumList.Albums
+		s.recordActivity("artist_watched", "artist", existing.ID,
+			fmt.Sprintf("Started watching full discography for %s (%d releases)", existing.Name, len(albums)))
+		s.startTask(
+			fmt.Sprintf("sync-artist-%d", existing.ID),
+			"sync_artist",
+			fmt.Sprintf("Syncing discography: %s", existing.Name),
+			fmt.Sprintf("Preparing %d releases...", len(albums)),
+			len(albums),
+			existing.ID,
+		)
 		s.bgWork.Add(1)
 		go func() {
 			defer s.bgWork.Done()
@@ -322,6 +437,16 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	albums := albumList.Albums
+	s.recordActivity("artist_watched", "artist", artist.ID,
+		fmt.Sprintf("Added %s to library (%d releases)", artist.Name, len(albums)))
+	s.startTask(
+		fmt.Sprintf("sync-artist-%d", artist.ID),
+		"sync_artist",
+		fmt.Sprintf("Syncing discography: %s", artist.Name),
+		fmt.Sprintf("Preparing %d releases...", len(albums)),
+		len(albums),
+		artist.ID,
+	)
 	s.bgWork.Add(1)
 	go func() {
 		defer s.bgWork.Done()
@@ -333,7 +458,16 @@ func (s *Server) handleWatchArtist(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) saveAlbumsFromProvider(providerName string, artistID int64, albums []*pb.AlbumSummary) {
 	ctx := context.Background()
-	for _, pa := range albums {
+	taskID := fmt.Sprintf("sync-artist-%d", artistID)
+	artistName := fmt.Sprintf("Artist #%d", artistID)
+	if a, err := s.queries.GetArtist(artistID); err == nil && a != nil {
+		artistName = a.Name
+	}
+	s.startTask(taskID, "sync_artist", fmt.Sprintf("Syncing discography: %s", artistName), "Starting...", len(albums), artistID)
+	defer s.finishTask(taskID)
+
+	for i, pa := range albums {
+		s.updateTask(taskID, i+1, fmt.Sprintf("Fetching release %d of %d: %s", i+1, len(albums), pa.Title))
 		if existingAlbum, _ := s.queries.FindAlbumByProvider(providerName, pa.Id); existingAlbum != nil {
 			if existingAlbum.Status != models.AlbumStatusIgnored {
 				s.syncAlbumTracks(ctx, providerName, existingAlbum)
@@ -341,6 +475,10 @@ func (s *Server) saveAlbumsFromProvider(providerName string, artistID int64, alb
 			continue
 		}
 		s.saveAlbumFromProvider(ctx, providerName, artistID, pa)
+	}
+	if len(albums) > 0 {
+		s.recordActivity("discography_synced", "artist", artistID,
+			fmt.Sprintf("Synced discography for %s (%d releases)", artistName, len(albums)))
 	}
 }
 
@@ -504,6 +642,9 @@ func (s *Server) handleWatchAlbum(w http.ResponseWriter, r *http.Request) {
 			Status:      models.TrackStatusWanted,
 		})
 	}
+
+	s.recordActivity("album_watched", "album", album.ID,
+		fmt.Sprintf("Added album to watchlist: %s - %s (%d tracks)", artist.Name, album.Title, len(albumDetail.Tracks)))
 
 	writeJSON(w, http.StatusCreated, album)
 }
@@ -1123,6 +1264,14 @@ func (s *Server) handleRelinkEntity(w http.ResponseWriter, r *http.Request) {
 			_ = s.queries.UpdateArtistStatus(id, models.ArtistStatusWatched)
 			reconciling = true
 			providerID := req.ProviderID
+			s.startTask(
+				fmt.Sprintf("reconcile-artist-%d", id),
+				"reconcile_artist",
+				fmt.Sprintf("Linking library: %s", prev.Name),
+				"Fetching provider discography...",
+				0,
+				id,
+			)
 			s.bgWork.Add(1)
 			go func() {
 				defer s.bgWork.Done()
