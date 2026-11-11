@@ -25,6 +25,44 @@ import (
 
 const defaultMaxConcurrentSlskd = 10
 
+const (
+	SourceArcod = "arcod"
+	SourceSlskd = "slskd"
+)
+
+var DefaultSourcePriority = []string{SourceArcod, SourceSlskd}
+
+// ValidateSourcePriority parses and normalizes a JSON array of download source names.
+// Unknown sources or empty lists are rejected; omitted known sources are appended in default order.
+func ValidateSourcePriority(raw string) ([]string, error) {
+	var parsed []string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, fmt.Errorf("must be a JSON array of source names")
+	}
+	if len(parsed) == 0 {
+		return nil, fmt.Errorf("must include at least one source")
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, s := range parsed {
+		norm := strings.ToLower(strings.TrimSpace(s))
+		if norm != SourceArcod && norm != SourceSlskd {
+			return nil, fmt.Errorf("unknown download source %q", s)
+		}
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	for _, def := range DefaultSourcePriority {
+		if !seen[def] {
+			out = append(out, def)
+		}
+	}
+	return out, nil
+}
+
 var unsafeFilenameChars = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 
 func sanitizeFilename(s string) string {
@@ -139,11 +177,6 @@ type ProgressItem struct {
 }
 
 func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
-	dirs, err := s.slskd.GetAllDownloads(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	activeTransfers := make(map[string]models.DownloadQueueItem)
 	downloading, _ := s.queries.ListDownloads("downloading")
 	for _, d := range downloading {
@@ -169,6 +202,15 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 				State:           "Downloading",
 			})
 		}
+	}
+
+	if !s.isSlskdEnabled() {
+		return items, nil
+	}
+
+	dirs, err := s.slskd.GetAllDownloads(ctx)
+	if err != nil {
+		return nil, err
 	}
 	for _, ud := range dirs {
 		for _, dir := range ud.Directories {
@@ -334,20 +376,128 @@ func (s *Service) getMaxConcurrent() int {
 	return n
 }
 
-// process kicks off a search for a pending download item.
+func (s *Service) isArcodEnabled() bool {
+	if s.arcod == nil || !s.arcod.IsEnabled() {
+		return false
+	}
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("arcod_enabled"); err == nil && (v == "false" || v == "0") {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) isSlskdEnabled() bool {
+	if s.slskd == nil {
+		return false
+	}
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("slskd_enabled"); err == nil && (v == "false" || v == "0") {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) sourcePriority() []string {
+	if s.queries != nil {
+		if raw, err := s.queries.GetSetting("download_source_priority"); err == nil && strings.TrimSpace(raw) != "" {
+			if p, err := ValidateSourcePriority(raw); err == nil {
+				return p
+			}
+		}
+	}
+	return append([]string(nil), DefaultSourcePriority...)
+}
+
+func (s *Service) sourceRank(name string) int {
+	for i, src := range s.sourcePriority() {
+		if src == name {
+			return i
+		}
+	}
+	return len(DefaultSourcePriority)
+}
+
+func (s *Service) enabledSources() []string {
+	var enabled []string
+	for _, src := range s.sourcePriority() {
+		switch src {
+		case SourceArcod:
+			if s.isArcodEnabled() {
+				enabled = append(enabled, src)
+			}
+		case SourceSlskd:
+			if s.isSlskdEnabled() {
+				enabled = append(enabled, src)
+			}
+		}
+	}
+	return enabled
+}
+
+func (s *Service) shouldFallbackToArcodAfterSlskd() bool {
+	return s.isArcodEnabled() && s.sourceRank(SourceSlskd) < s.sourceRank(SourceArcod)
+}
+
+type arcodOutcome int
+
+const (
+	arcodDownloaded arcodOutcome = iota
+	arcodOrganizePending
+	arcodNoMatch
+	arcodFailed
+)
+
+// process kicks off a download attempt across enabled sources in priority order.
 func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error {
 	track, err := s.queries.GetTrackWithMeta(d.TrackID)
 	if err != nil {
 		return err
 	}
 
-	// Try Arcod first if enabled
-	if s.arcod != nil && s.arcod.IsEnabled() {
-		if s.tryArcodDownload(ctx, d, track) {
-			return nil
-		}
+	sources := s.enabledSources()
+	if len(sources) == 0 {
+		errStr := "all download sources are disabled"
+		_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
+		return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errStr)
 	}
 
+	if sources[0] == SourceArcod {
+		outcome, arcodErr := s.tryArcodDownload(ctx, d, track)
+		if outcome == arcodDownloaded || outcome == arcodOrganizePending {
+			return nil
+		}
+		if s.isSlskdEnabled() {
+			return s.startSlskdSearch(ctx, d, track)
+		}
+		if outcome == arcodNoMatch {
+			errStr := "no match found on arcod"
+			_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
+			return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errStr)
+		}
+		msg := "arcod download failed"
+		if arcodErr != nil {
+			msg = arcodErr.Error()
+		}
+		return s.failWithRetry(d, msg)
+	}
+
+	// Primary is slskd.
+	if err := s.startSlskdSearch(ctx, d, track); err != nil {
+		if s.isArcodEnabled() {
+			outcome, _ := s.tryArcodDownload(ctx, d, track)
+			if outcome == arcodDownloaded || outcome == arcodOrganizePending {
+				return nil
+			}
+		}
+		return s.failWithRetry(d, err.Error())
+	}
+	return nil
+}
+
+func (s *Service) startSlskdSearch(ctx context.Context, d models.DownloadQueueItem, track *models.Track) error {
 	query := matching.CleanSearchQuery(track.ArtistName, track.Title)
 	slog.Info("downloader: searching", "query", query, "track_id", track.ID)
 	s.logActivity("search_started", "track", track.ID,
@@ -355,14 +505,14 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 
 	search, err := s.slskd.StartSearch(ctx, query)
 	if err != nil {
-		return s.failWithRetry(d, err.Error())
+		return err
 	}
 
 	return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusSearching, &search.ID, nil)
 }
 
-func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueItem, track *models.Track) bool {
-	slog.Info("downloader: checking arcod primary source", "artist", track.ArtistName, "title", track.Title, "album", track.AlbumTitle, "track_id", track.ID)
+func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueItem, track *models.Track) (arcodOutcome, error) {
+	slog.Info("downloader: checking arcod source", "artist", track.ArtistName, "title", track.Title, "album", track.AlbumTitle, "track_id", track.ID)
 	arcodTrack, err := s.arcod.FindBestTrackMatch(ctx, arcod.MatchQuery{
 		Artist:     track.ArtistName,
 		Title:      track.Title,
@@ -370,12 +520,12 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 		DurationMs: track.DurationMs,
 	})
 	if err != nil {
-		slog.Warn("downloader: arcod search error, falling back to slskd", "error", err, "track_id", track.ID)
-		return false
+		slog.Warn("downloader: arcod search error", "error", err, "track_id", track.ID)
+		return arcodFailed, err
 	}
 	if arcodTrack == nil {
-		slog.Info("downloader: no match on arcod, falling back to slskd", "artist", track.ArtistName, "title", track.Title)
-		return false
+		slog.Info("downloader: no match on arcod", "artist", track.ArtistName, "title", track.Title)
+		return arcodNoMatch, nil
 	}
 
 	slog.Info("downloader: match found on arcod, downloading lossless FLAC", "track_id", track.ID, "arcod_id", arcodTrack.ID, "title", arcodTrack.Title)
@@ -394,22 +544,22 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 
 	_, err = s.arcod.DownloadTrack(ctx, arcodTrack.ID, arcod.DefaultQuality, destPath)
 	if err != nil {
-		slog.Warn("downloader: arcod stream download failed, falling back to slskd", "error", err, "track_id", track.ID)
+		slog.Warn("downloader: arcod stream download failed", "error", err, "track_id", track.ID)
 		_ = os.Remove(destPath)
 		_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
-		return false
+		return arcodFailed, err
 	}
 
 	if err := s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusOrganizing, &arcodKey, nil); err != nil {
 		slog.Error("downloader: update status to organizing failed", "error", err)
-		return false
+		return arcodFailed, err
 	}
 
 	trackCopy := *track
 	trackCopy.FilePath = &destFileName
 	if err := s.organizer.Organize(&trackCopy); err != nil {
 		slog.Error("downloader: organize arcod download failed, will retry", "filename", destFileName, "track_id", track.ID, "error", err)
-		return true // remain in organizing state so retryOrganize handles it
+		return arcodOrganizePending, nil // remain in organizing state so retryOrganize handles it
 	}
 
 	s.logActivity("download_complete", "track", track.ID,
@@ -418,7 +568,7 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 		n.TriggerScan(ctx)
 	}
 	_ = s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusComplete, &arcodKey, nil)
-	return true
+	return arcodDownloaded, nil
 }
 
 // checkSearch polls a search and initiates download when results are ready.
@@ -449,6 +599,12 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 	best := pickBestFile(search.Responses, track, s.queries, cfg)
 	if best == nil {
 		_ = s.slskd.DeleteSearch(ctx, *d.SlskdSearchID)
+		if s.shouldFallbackToArcodAfterSlskd() {
+			outcome, _ := s.tryArcodDownload(ctx, d, track)
+			if outcome == arcodDownloaded || outcome == arcodOrganizePending {
+				return nil
+			}
+		}
 		errStr := "no suitable file found"
 		s.logActivity("download_failed", "track", track.ID,
 			fmt.Sprintf("No results for: %s - %s", track.ArtistName, track.Title))
@@ -614,6 +770,14 @@ func (s *Service) failWithRetry(d models.DownloadQueueItem, errMsg string) error
 	backoff := retryDelay(d.Attempts)
 	// 5m + 15m + 30m + 1h = 1h50m cumulative at attempt 4; stop after ~2h
 	if d.Attempts >= 4 {
+		if s.shouldFallbackToArcodAfterSlskd() {
+			if track, err := s.queries.GetTrackWithMeta(d.TrackID); err == nil && track != nil {
+				outcome, _ := s.tryArcodDownload(context.Background(), d, track)
+				if outcome == arcodDownloaded || outcome == arcodOrganizePending {
+					return nil
+				}
+			}
+		}
 		_ = s.queries.UpdateTrackStatus(d.TrackID, models.TrackStatusWanted)
 		if d.Source == "scheduler" {
 			slog.Info("downloader: removing exhausted scheduler download", "download_id", d.ID)
@@ -671,8 +835,10 @@ type ManualSearchResult struct {
 	DetectedLanguage string `json:"detected_language,omitempty"`
 }
 
-// ManualSearch runs a slskd search for a track and returns all scored results.
-// StartManualSearch kicks off an slskd search and returns the search ID and query used.
+const arcodOnlySearchID = "arcod-only"
+
+// ManualSearch runs a search across enabled download sources and returns scored results.
+// StartManualSearch kicks off an slskd search (or returns a virtual search ID if only Arcod is enabled).
 // If customQuery is non-empty, it is used instead of the default "artist title" query.
 func (s *Service) StartManualSearch(ctx context.Context, trackID int64, customQuery string) (string, string, error) {
 	track, err := s.queries.GetTrackWithMeta(trackID)
@@ -683,8 +849,22 @@ func (s *Service) StartManualSearch(ctx context.Context, trackID int64, customQu
 	if customQuery != "" {
 		query = customQuery
 	}
+
+	slskdOn := s.isSlskdEnabled()
+	arcodOn := s.isArcodEnabled()
+	if !slskdOn && !arcodOn {
+		return "", "", fmt.Errorf("all download sources are disabled")
+	}
+	if !slskdOn {
+		return arcodOnlySearchID, query, nil
+	}
+
 	search, err := s.slskd.StartSearch(ctx, query)
 	if err != nil {
+		if arcodOn {
+			slog.Warn("downloader: slskd manual search failed, falling back to arcod-only", "error", err)
+			return arcodOnlySearchID, query, nil
+		}
 		return "", "", fmt.Errorf("start search: %w", err)
 	}
 	return search.ID, query, nil
@@ -697,11 +877,28 @@ type ManualSearchResponse struct {
 	FileCount  int                  `json:"file_count"`
 }
 
-// PollManualSearch returns the current scored results for an in-progress search.
+// PollManualSearch returns the current scored results for an in-progress search,
+// ordering source groups according to download_source_priority.
 func (s *Service) PollManualSearch(ctx context.Context, trackID int64, searchID string) (*ManualSearchResponse, error) {
 	track, err := s.queries.GetTrackWithMeta(trackID)
 	if err != nil {
 		return nil, err
+	}
+
+	var arcodRes []ManualSearchResult
+	if s.isArcodEnabled() {
+		arcodRes = s.getArcodManualResults(ctx, trackID, track)
+	}
+
+	if searchID == arcodOnlySearchID {
+		if arcodRes == nil {
+			arcodRes = []ManualSearchResult{}
+		}
+		return &ManualSearchResponse{
+			Results:    arcodRes,
+			IsComplete: true,
+			FileCount:  len(arcodRes),
+		}, nil
 	}
 
 	search, err := s.slskd.GetSearch(ctx, searchID)
@@ -714,10 +911,17 @@ func (s *Service) PollManualSearch(ctx context.Context, trackID int64, searchID 
 	cfg.includeAll = true // manual search surfaces every slskd result; the user picks
 	candidates := scoreCandidates(search.Responses, track, nil, cfg)
 
-	formatted := formatCandidates(candidates, s.queries, cfg.negativeKeywords, track)
-	if s.arcod != nil && s.arcod.IsEnabled() {
-		arcodRes := s.getArcodManualResults(ctx, trackID, track)
-		formatted = append(arcodRes, formatted...)
+	slskdRes := formatCandidates(candidates, s.queries, cfg.negativeKeywords, track)
+	var formatted []ManualSearchResult
+	if s.sourceRank(SourceSlskd) < s.sourceRank(SourceArcod) {
+		formatted = append(formatted, slskdRes...)
+		formatted = append(formatted, arcodRes...)
+	} else {
+		formatted = append(formatted, arcodRes...)
+		formatted = append(formatted, slskdRes...)
+	}
+	if formatted == nil {
+		formatted = []ManualSearchResult{}
 	}
 
 	return &ManualSearchResponse{
@@ -807,6 +1011,9 @@ func (s *Service) getArcodManualResults(ctx context.Context, trackID int64, trac
 
 // CleanupSearch deletes an slskd search.
 func (s *Service) CleanupSearch(ctx context.Context, searchID string) {
+	if searchID == "" || searchID == arcodOnlySearchID || !s.isSlskdEnabled() {
+		return
+	}
 	_ = s.slskd.DeleteSearch(ctx, searchID)
 }
 
@@ -872,7 +1079,10 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 		return err
 	}
 
-	if (strings.HasPrefix(username, "arcod") || strings.HasPrefix(filename, "arcod:")) && s.arcod != nil {
+	if strings.HasPrefix(username, "arcod") || strings.HasPrefix(filename, "arcod:") {
+		if !s.isArcodEnabled() {
+			return fmt.Errorf("arcod is disabled in settings")
+		}
 		var arcodID int64
 		if strings.HasPrefix(filename, "arcod:") {
 			rest := strings.TrimPrefix(filename, "arcod:")
@@ -932,6 +1142,10 @@ func (s *Service) ManualDownload(ctx context.Context, trackID int64, username, f
 		}
 		_ = s.queries.UpdateDownloadStatus(dlID, models.DownloadStatusComplete, &transferKey, nil)
 		return nil
+	}
+
+	if !s.isSlskdEnabled() {
+		return fmt.Errorf("slskd is disabled in settings")
 	}
 
 	_ = s.queries.UpdateTrackDownloadedFrom(trackID, username)

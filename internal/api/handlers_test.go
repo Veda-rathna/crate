@@ -1211,6 +1211,25 @@ func TestSettingsNamingTemplateValidated(t *testing.T) {
 	}
 }
 
+func TestSettingsDownloadSourcePriorityAndFlagsValidated(t *testing.T) {
+	env := newTestEnv(t)
+
+	w := env.do("PUT", "/api/settings", `{"download_source_priority": "[\"bogus\"]"}`)
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for invalid source priority, got %d", w.Code)
+	}
+
+	w = env.do("PUT", "/api/settings", `{"slskd_enabled": "maybe"}`)
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for invalid slskd_enabled, got %d", w.Code)
+	}
+
+	w = env.do("PUT", "/api/settings", `{"download_source_priority": "[\"slskd\",\"arcod\"]", "slskd_enabled": "true", "arcod_enabled": "false"}`)
+	if w.Code != 200 {
+		t.Fatalf("expected 200 for valid source priority and flags, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestNamingPreview(t *testing.T) {
 	env := newTestEnv(t)
 

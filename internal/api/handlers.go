@@ -21,6 +21,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/naming"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/reject"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
 )
@@ -1587,6 +1588,22 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if v, ok := settings[naming.SettingKey]; ok && strings.TrimSpace(v) != "" {
 		if err := naming.Validate(v); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid naming template: "+err.Error())
+			return
+		}
+	}
+	if v, ok := settings["download_source_priority"]; ok && strings.TrimSpace(v) != "" {
+		norm, err := downloader.ValidateSourcePriority(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid download_source_priority: "+err.Error())
+			return
+		}
+		if b, err := json.Marshal(norm); err == nil {
+			settings["download_source_priority"] = string(b)
+		}
+	}
+	for _, boolKey := range []string{"arcod_enabled", "slskd_enabled"} {
+		if v, ok := settings[boolKey]; ok && v != "" && v != "true" && v != "false" {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid %s: must be 'true' or 'false'", boolKey))
 			return
 		}
 	}

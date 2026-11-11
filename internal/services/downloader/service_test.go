@@ -2,12 +2,16 @@ package downloader
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
@@ -1110,5 +1114,211 @@ func TestScoreCandidatesTieBreaksByBitDepthSampleRateSize(t *testing.T) {
 	best := pickBestFile(results, track, nil, cfg)
 	if best == nil || best.username != "larger" {
 		t.Errorf("expected tie-break to larger size, got %+v", best)
+	}
+}
+
+type noopTestOrganizer struct{}
+
+func (o *noopTestOrganizer) Organize(track *models.Track) error { return nil }
+
+func newPriorityTestService(t *testing.T, slskdHandler http.HandlerFunc, fa *fakeArcodProvider) (*Service, *db.Queries, int64) {
+	t.Helper()
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	q := db.NewQueries(database)
+
+	artist := &models.Artist{Name: "Test Artist", Provider: "test", ProviderID: "ar1", Status: models.ArtistStatusWatched}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	album := &models.Album{ArtistID: artist.ID, Title: "Test Album", Provider: "test", ProviderID: "al1", RecordType: "album", Status: models.AlbumStatusWatched}
+	if err := q.CreateAlbum(album); err != nil {
+		t.Fatal(err)
+	}
+	track := &models.Track{AlbumID: album.ID, Title: "Test Track", TrackNumber: 1, DiscNumber: 1, DurationMs: 200000, Provider: "test", ProviderID: "tr1", Status: models.TrackStatusWanted}
+	if err := q.CreateTrack(track); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(slskdHandler)
+	t.Cleanup(srv.Close)
+
+	dl := NewService(q, slskd.NewClient(srv.URL, "key"), &noopTestOrganizer{}, nil)
+	dl.SetDownloadsDir(t.TempDir())
+	if fa != nil {
+		dl.SetArcod(fa)
+	}
+	return dl, q, track.ID
+}
+
+func TestValidateSourcePriority(t *testing.T) {
+	got, err := ValidateSourcePriority(`["slskd","arcod"]`)
+	if err != nil || len(got) != 2 || got[0] != "slskd" || got[1] != "arcod" {
+		t.Fatalf("unexpected ValidateSourcePriority result: %v, err=%v", got, err)
+	}
+	got, err = ValidateSourcePriority(`["slskd"]`)
+	if err != nil || len(got) != 2 || got[0] != "slskd" || got[1] != "arcod" {
+		t.Fatalf("expected omitted source appended, got %v, err=%v", got, err)
+	}
+	if _, err := ValidateSourcePriority(`["invalid"]`); err == nil {
+		t.Error("expected error for unknown source")
+	}
+	if _, err := ValidateSourcePriority(`[]`); err == nil {
+		t.Error("expected error for empty priority list")
+	}
+}
+
+func TestDownloadSourcePriority_SlskdFirstWithArcodFallback(t *testing.T) {
+	var slskdSearches int
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/api/v0/searches"):
+			slskdSearches++
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "s-1"})
+		case r.Method == "GET" && strings.Contains(r.URL.Path, "/api/v0/searches/s-1"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "s-1", "isComplete": true, "responses": []any{},
+			})
+		case r.Method == "DELETE":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	fa := &fakeArcodProvider{
+		enabled:   true,
+		bestTrack: &arcod.TrackItem{ID: 77, Title: "Test Track", Artist: "Test Artist"},
+	}
+	dl, q, trackID := newPriorityTestService(t, handler, fa)
+	_ = q.SetSetting("download_source_priority", `["slskd","arcod"]`)
+	_ = q.EnqueueDownload(trackID)
+
+	items, _ := q.ListDownloads("pending")
+	if err := dl.process(context.Background(), items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if slskdSearches != 1 {
+		t.Fatalf("expected slskd search to run first, got %d searches", slskdSearches)
+	}
+	if len(fa.downloaded) != 0 {
+		t.Fatalf("expected arcod NOT to download yet while slskd search is pending")
+	}
+
+	// Polling empty slskd search should fall back to Arcod and complete.
+	searching, _ := q.ListDownloads("searching")
+	if len(searching) != 1 {
+		t.Fatalf("expected 1 searching item, got %d", len(searching))
+	}
+	if err := dl.checkSearch(context.Background(), searching[0]); err != nil {
+		t.Fatal(err)
+	}
+	if fa.downloaded[77] == "" {
+		t.Errorf("expected fallback download via arcod track 77")
+	}
+	done, _ := q.ListDownloads("complete")
+	if len(done) != 1 {
+		t.Errorf("expected 1 complete download after arcod fallback, got %d", len(done))
+	}
+}
+
+func TestDownloadSourceDisable_SlskdDisabledAndArcodDisabled(t *testing.T) {
+	var slskdCalls int
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		slskdCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+
+	fa := &fakeArcodProvider{
+		enabled: true,
+		items:   []arcod.TrackItem{{ID: 88, Title: "Test Track", Artist: "Test Artist", Streamable: true, Duration: 200}},
+	}
+	dl, q, trackID := newPriorityTestService(t, handler, fa)
+
+	// 1) Disable slskd -> GetProgress, process, and manual search work without hitting slskd.
+	_ = q.SetSetting("slskd_enabled", "false")
+	if _, err := dl.GetProgress(context.Background()); err != nil {
+		t.Fatalf("GetProgress should not fail when slskd is disabled: %v", err)
+	}
+	searchID, _, err := dl.StartManualSearch(context.Background(), trackID, "")
+	if err != nil || searchID != arcodOnlySearchID {
+		t.Fatalf("expected arcod-only manual search id, got %q err=%v", searchID, err)
+	}
+	pollResp, err := dl.PollManualSearch(context.Background(), trackID, searchID)
+	if err != nil || !pollResp.IsComplete || len(pollResp.Results) != 1 {
+		t.Fatalf("expected 1 completed arcod manual result, got %+v err=%v", pollResp, err)
+	}
+	_ = q.EnqueueDownload(trackID)
+	items, _ := q.ListDownloads("pending")
+	if err := dl.process(context.Background(), items[0]); err != nil {
+		t.Fatal(err)
+	}
+	failed, _ := q.ListDownloads("failed")
+	if len(failed) != 1 {
+		t.Fatalf("expected immediate failed download when arcod has no match and slskd is disabled, got %d", len(failed))
+	}
+	if slskdCalls != 0 {
+		t.Errorf("expected 0 slskd HTTP calls when slskd is disabled, got %d", slskdCalls)
+	}
+
+	// 2) Also disable arcod -> both disabled fails cleanly and manual search errors.
+	_ = q.SetSetting("arcod_enabled", "false")
+	if _, _, err := dl.StartManualSearch(context.Background(), trackID, ""); err == nil {
+		t.Error("expected StartManualSearch error when all sources disabled")
+	}
+	_ = q.ReenqueueDownload(trackID)
+	items, _ = q.ListDownloads("pending")
+	if err := dl.process(context.Background(), items[0]); err != nil {
+		t.Fatal(err)
+	}
+	failed, _ = q.ListDownloads("failed")
+	if len(failed) == 0 || failed[0].Error == nil || !strings.Contains(*failed[0].Error, "disabled") {
+		t.Errorf("expected 'disabled' failure message when both sources disabled, got %+v", failed)
+	}
+}
+
+func TestPollManualSearchOrdersBySourcePriority(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":         "s-prio",
+			"isComplete": true,
+			"fileCount":  1,
+			"responses": []map[string]any{
+				{
+					"username":          "soulseek-peer",
+					"hasFreeUploadSlot": true,
+					"files": []map[string]any{
+						{"filename": "Test Artist/Test Album/01 - Test Track.flac", "size": 30000000},
+					},
+				},
+			},
+		})
+	}
+	fa := &fakeArcodProvider{
+		enabled: true,
+		items:   []arcod.TrackItem{{ID: 99, Title: "Test Track", Artist: "Test Artist", Streamable: true, Duration: 200}},
+	}
+	dl, q, trackID := newPriorityTestService(t, handler, fa)
+
+	// Default (arcod first)
+	resp, err := dl.PollManualSearch(context.Background(), trackID, "s-prio")
+	if err != nil || len(resp.Results) != 2 {
+		t.Fatalf("expected 2 results, got %+v err=%v", resp, err)
+	}
+	if !strings.HasPrefix(resp.Results[0].Username, "arcod") {
+		t.Errorf("expected arcod first by default, got %q", resp.Results[0].Username)
+	}
+
+	// Slskd first
+	_ = q.SetSetting("download_source_priority", `["slskd","arcod"]`)
+	resp, err = dl.PollManualSearch(context.Background(), trackID, "s-prio")
+	if err != nil || len(resp.Results) != 2 {
+		t.Fatalf("expected 2 results, got %+v err=%v", resp, err)
+	}
+	if resp.Results[0].Username != "soulseek-peer" {
+		t.Errorf("expected soulseek-peer first when slskd priority is higher, got %q", resp.Results[0].Username)
 	}
 }

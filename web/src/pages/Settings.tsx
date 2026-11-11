@@ -13,6 +13,40 @@ interface QualityTier {
 }
 
 type SettingsTab = 'all' | 'providers' | 'library' | 'downloads' | 'integrations' | 'maintenance';
+type DownloadSource = 'arcod' | 'slskd';
+
+const DEFAULT_SOURCE_PRIORITY: DownloadSource[] = ['arcod', 'slskd'];
+
+const SOURCE_META: Record<DownloadSource, { label: string; description: string }> = {
+  arcod: {
+    label: 'Arcod (arcod.xyz)',
+    description: 'Direct lossless FLAC streaming & CDN downloads',
+  },
+  slskd: {
+    label: 'slskd (Soulseek)',
+    description: 'Peer-to-peer Soulseek search & transfers',
+  },
+};
+
+function parseSourcePriority(raw?: string): DownloadSource[] {
+  if (!raw) return [...DEFAULT_SOURCE_PRIORITY];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [...DEFAULT_SOURCE_PRIORITY];
+    const out: DownloadSource[] = [];
+    for (const item of parsed) {
+      if ((item === 'arcod' || item === 'slskd') && !out.includes(item)) {
+        out.push(item);
+      }
+    }
+    for (const def of DEFAULT_SOURCE_PRIORITY) {
+      if (!out.includes(def)) out.push(def);
+    }
+    return out;
+  } catch {
+    return [...DEFAULT_SOURCE_PRIORITY];
+  }
+}
 
 function tierLabel(format: string, bitrate?: number): string {
   const name = format.toUpperCase();
@@ -185,6 +219,7 @@ export default function Settings() {
   const [activeTab, setActiveTab] = useState<SettingsTab>('all');
   const [form, setForm] = useState<Record<string, string>>({});
   const [tiers, setTiers] = useState<QualityTier[]>([]);
+  const [sourcePriority, setSourcePriority] = useState<DownloadSource[]>(DEFAULT_SOURCE_PRIORITY);
   const [negativeKeywords, setNegativeKeywords] = useState<string[]>([]);
   const [baselinePayload, setBaselinePayload] = useState<string>('');
   const [saved, setSaved] = useState(false);
@@ -215,11 +250,16 @@ export default function Settings() {
           /* ignore */
         }
       }
+      const parsedSources = parseSourcePriority(settings.download_source_priority);
       setTiers(parsedTiers);
+      setSourcePriority(parsedSources);
       setNegativeKeywords(parsedKw);
       setBaselinePayload(
         JSON.stringify({
           ...settings,
+          arcod_enabled: settings.arcod_enabled ?? 'true',
+          slskd_enabled: settings.slskd_enabled ?? 'true',
+          download_source_priority: JSON.stringify(parsedSources),
           quality_tiers: JSON.stringify(parsedTiers),
           quality_fallback_enabled: settings.quality_fallback_enabled ?? 'true',
           negative_keywords: JSON.stringify(parsedKw),
@@ -232,11 +272,14 @@ export default function Settings() {
     () =>
       JSON.stringify({
         ...form,
+        arcod_enabled: form.arcod_enabled ?? 'true',
+        slskd_enabled: form.slskd_enabled ?? 'true',
+        download_source_priority: JSON.stringify(sourcePriority),
         quality_tiers: JSON.stringify(tiers),
         quality_fallback_enabled: form.quality_fallback_enabled ?? 'true',
         negative_keywords: JSON.stringify(negativeKeywords),
       }),
-    [form, tiers, negativeKeywords]
+    [form, sourcePriority, tiers, negativeKeywords]
   );
 
   const isDirty = !!baselinePayload && currentPayload !== baselinePayload;
@@ -278,6 +321,9 @@ export default function Settings() {
     mutationFn: () =>
       api.updateSettings({
         ...form,
+        arcod_enabled: form.arcod_enabled ?? 'true',
+        slskd_enabled: form.slskd_enabled ?? 'true',
+        download_source_priority: JSON.stringify(sourcePriority),
         quality_tiers: JSON.stringify(tiers),
         quality_fallback_enabled: form.quality_fallback_enabled ?? 'true',
         negative_keywords: JSON.stringify(negativeKeywords),
@@ -295,6 +341,7 @@ export default function Settings() {
   const discardChanges = useCallback(() => {
     if (!settings) return;
     setForm(settings);
+    setSourcePriority(parseSourcePriority(settings.download_source_priority));
     try {
       setTiers(settings.quality_tiers ? JSON.parse(settings.quality_tiers) : []);
     } catch {
@@ -308,6 +355,17 @@ export default function Settings() {
       setNegativeKeywords([]);
     }
   }, [settings]);
+
+  const moveSource = useCallback(
+    (index: number, direction: -1 | 1) => {
+      const next = index + direction;
+      if (next < 0 || next >= sourcePriority.length) return;
+      const updated = [...sourcePriority];
+      [updated[index], updated[next]] = [updated[next], updated[index]];
+      setSourcePriority(updated);
+    },
+    [sourcePriority]
+  );
 
   const moveTier = useCallback(
     (index: number, direction: -1 | 1) => {
@@ -338,7 +396,8 @@ export default function Settings() {
   });
 
   const showSection = (tab: SettingsTab) => activeTab === 'all' || activeTab === tab;
-  const arcodEnabled = form.arcod_enabled === 'true';
+  const arcodEnabled = form.arcod_enabled !== 'false';
+  const slskdEnabled = form.slskd_enabled !== 'false';
 
   return (
     <div className="space-y-5 pb-16">
@@ -612,14 +671,113 @@ export default function Settings() {
       {showSection('downloads') && (
         <div className="space-y-5">
           <SettingsSection
-            title="Arcod (Primary FLAC Downloader)"
-            description="Optional high-resolution FLAC source checked before falling back to Soulseek peers."
+            title="Download Source Priority"
+            description="Choose which download source Crate tries first and enable or disable individual services. If the primary source finds no match or fails, Crate falls back to the next enabled source."
+          >
+            <div className="space-y-2">
+              {sourcePriority.map((src, i) => {
+                const enabled = src === 'arcod' ? arcodEnabled : slskdEnabled;
+                const toggleKey = src === 'arcod' ? 'arcod_enabled' : 'slskd_enabled';
+                const meta = SOURCE_META[src];
+                return (
+                  <div
+                    key={src}
+                    className={`flex items-center gap-3 bg-zinc-950/60 border rounded-xl px-3.5 py-2.5 transition-opacity ${
+                      enabled ? 'border-white/[0.06]' : 'border-white/[0.04] opacity-60'
+                    }`}
+                  >
+                    <span className="text-xs font-mono text-zinc-500 w-5 text-right shrink-0 tabular-nums">
+                      #{i + 1}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-medium text-zinc-100 truncate">{meta.label}</p>
+                        {!enabled && (
+                          <span className="text-[10px] font-semibold uppercase px-1.5 py-px rounded bg-zinc-800 text-zinc-400 border border-white/[0.06]">
+                            Disabled
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-zinc-500 truncate">{meta.description}</p>
+                    </div>
+                    <div className="flex flex-col gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => moveSource(i, -1)}
+                        disabled={i === 0}
+                        className="p-1 text-zinc-400 hover:text-white disabled:opacity-20 transition-colors"
+                        aria-label={`Move ${meta.label} up`}
+                      >
+                        <svg
+                          className="w-3.5 h-3.5"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="m18 15-6-6-6 6" />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => moveSource(i, 1)}
+                        disabled={i === sourcePriority.length - 1}
+                        className="p-1 text-zinc-400 hover:text-white disabled:opacity-20 transition-colors"
+                        aria-label={`Move ${meta.label} down`}
+                      >
+                        <svg
+                          className="w-3.5 h-3.5"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="m6 9 6 6 6-6" />
+                        </svg>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label={`Toggle ${meta.label}`}
+                      aria-checked={enabled}
+                      onClick={() =>
+                        setForm({ ...form, [toggleKey]: enabled ? 'false' : 'true' })
+                      }
+                      className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition-colors ${
+                        enabled ? 'bg-emerald-500' : 'bg-zinc-700'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 rounded-full bg-white shadow transform transition-transform mt-0.5 ${
+                          enabled ? 'translate-x-[22px]' : 'translate-x-0.5'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            {!arcodEnabled && !slskdEnabled && (
+              <div className="rounded-xl bg-amber-950/35 border border-amber-500/30 px-3.5 py-2.5 text-xs text-amber-200">
+                Both Arcod and slskd are disabled — automatic downloads and manual searches will fail until at least one source is enabled.
+              </div>
+            )}
+          </SettingsSection>
+
+          <SettingsSection
+            title="Arcod"
+            description="High-resolution FLAC source via arcod.xyz."
           >
             <label className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl px-3.5 py-3 mb-3 cursor-pointer">
               <div>
                 <p className="text-sm font-medium text-zinc-100">Enable Arcod</p>
                 <p className="text-[11px] text-zinc-400">
-                  Check arcod.xyz for direct lossless FLAC before querying slskd
+                  Allow direct lossless FLAC searches and downloads via arcod.xyz
                 </p>
               </div>
               <button
@@ -653,6 +811,31 @@ export default function Settings() {
           </SettingsSection>
 
           <SettingsSection title="slskd (Soulseek)">
+            <label className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl px-3.5 py-3 mb-3 cursor-pointer">
+              <div>
+                <p className="text-sm font-medium text-zinc-100">Enable slskd</p>
+                <p className="text-[11px] text-zinc-400">
+                  Allow peer-to-peer Soulseek searches and transfers via slskd
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={slskdEnabled}
+                onClick={() =>
+                  setForm({ ...form, slskd_enabled: slskdEnabled ? 'false' : 'true' })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition-colors ${
+                  slskdEnabled ? 'bg-emerald-500' : 'bg-zinc-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-5 w-5 rounded-full bg-white shadow transform transition-transform mt-0.5 ${
+                    slskdEnabled ? 'translate-x-[22px]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </label>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {SLSKD_FIELDS.map((field) => (
                 <SettingInput
