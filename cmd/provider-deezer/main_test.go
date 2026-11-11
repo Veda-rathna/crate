@@ -301,3 +301,49 @@ func TestDeezerGetArtistAlbumsPaginatesAndChecksJSONErrors(t *testing.T) {
 		t.Fatal("expected error for Deezer HTTP-200 JSON quota error payload")
 	}
 }
+
+func TestDeezerGetAlbumMetadata(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/album/777", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":           777,
+			"title":        "Leo",
+			"release_date": "2023-10-19",
+			"upc":          "3617224112233",
+			"label":        "Sony Music South",
+			"genres": map[string]any{
+				"data": []map[string]any{
+					{"id": 1, "name": "Tamil"},
+					{"id": 2, "name": "Indian"},
+				},
+			},
+			"artist": map[string]any{"name": "Anirudh Ravichander"},
+		})
+	})
+	mux.HandleFunc("/album/777/tracks", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": 1, "title": "Naa Ready", "track_position": 1, "disk_number": 1, "duration": 248},
+			},
+			"total": 1,
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestServer(t, fake.URL)
+
+	resp, err := client.GetAlbum(context.Background(), &pb.EntityRequest{Id: "777"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Metadata["upc"] != "3617224112233" {
+		t.Errorf("expected upc, got %q", resp.Metadata["upc"])
+	}
+	if resp.Metadata["label"] != "Sony Music South" {
+		t.Errorf("expected label Sony Music South, got %q", resp.Metadata["label"])
+	}
+	if resp.Metadata["genres"] != "Tamil, Indian" {
+		t.Errorf("expected genres 'Tamil, Indian', got %q", resp.Metadata["genres"])
+	}
+}

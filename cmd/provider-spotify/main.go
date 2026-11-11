@@ -406,10 +406,19 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		DurationMs  int    `json:"duration_ms"`
 	}
 	var albumResp struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		ReleaseDate string `json:"release_date"`
-		Artists     []struct {
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		ReleaseDate string   `json:"release_date"`
+		Label       string   `json:"label"`
+		Genres      []string `json:"genres"`
+		ExternalIDs struct {
+			UPC string `json:"upc"`
+			EAN string `json:"ean"`
+		} `json:"external_ids"`
+		Copyrights []struct {
+			Text string `json:"text"`
+		} `json:"copyrights"`
+		Artists []struct {
 			Name string `json:"name"`
 		} `json:"artists"`
 		Images []imageItem `json:"images"`
@@ -460,6 +469,41 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		})
 	}
 
+	meta := map[string]string{}
+	if upc := strings.TrimSpace(albumResp.ExternalIDs.UPC); upc != "" {
+		meta["upc"] = upc
+	} else if ean := strings.TrimSpace(albumResp.ExternalIDs.EAN); ean != "" {
+		meta["upc"] = ean
+	}
+	if label := strings.TrimSpace(albumResp.Label); label != "" {
+		meta["label"] = label
+	}
+	if len(albumResp.Genres) > 0 {
+		var genres []string
+		for _, g := range albumResp.Genres {
+			if trimmed := strings.TrimSpace(g); trimmed != "" {
+				genres = append(genres, trimmed)
+			}
+		}
+		if len(genres) > 0 {
+			meta["genres"] = strings.Join(genres, ", ")
+		}
+	}
+	if len(albumResp.Copyrights) > 0 {
+		var cps []string
+		for _, c := range albumResp.Copyrights {
+			if trimmed := strings.TrimSpace(c.Text); trimmed != "" {
+				cps = append(cps, trimmed)
+			}
+		}
+		if len(cps) > 0 {
+			meta["copyrights"] = strings.Join(cps, "; ")
+		}
+	}
+	if len(meta) == 0 {
+		meta = nil
+	}
+
 	return &pb.AlbumDetail{
 		Id:         albumResp.ID,
 		Title:      albumResp.Name,
@@ -467,6 +511,7 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		Year:       int32(year),
 		ArtistName: artistName,
 		Tracks:     tracks,
+		Metadata:   meta,
 	}, nil
 }
 

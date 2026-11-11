@@ -573,3 +573,50 @@ func TestSpotifyGetArtistAlbumsPaginatesPast100AndKeepsSameTitleAcrossYears(t *t
 	}
 }
 
+func TestSpotifyGetAlbumMetadata(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/albums/tam-1", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":           "tam-1",
+			"name":         "Vikram",
+			"release_date": "2022-05-15",
+			"label":        "Think Music",
+			"genres":       []string{"tamil pop"},
+			"external_ids": map[string]any{
+				"upc": "8901112223334",
+			},
+			"copyrights": []map[string]any{
+				{"text": "© 2022 Raaj Kamal Films International"},
+			},
+			"artists": []map[string]any{{"name": "Anirudh Ravichander"}},
+			"tracks": map[string]any{
+				"total": 1,
+				"items": []map[string]any{
+					{"id": "tr-1", "name": "Pathala Pathala", "track_number": 1, "disc_number": 1, "duration_ms": 210000},
+				},
+			},
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestSpotifyServer(t, fake.URL, nil)
+
+	resp, err := client.GetAlbum(context.Background(), &pb.EntityRequest{Id: "tam-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Metadata["upc"] != "8901112223334" {
+		t.Errorf("expected upc, got %q", resp.Metadata["upc"])
+	}
+	if resp.Metadata["label"] != "Think Music" {
+		t.Errorf("expected label Think Music, got %q", resp.Metadata["label"])
+	}
+	if resp.Metadata["genres"] != "tamil pop" {
+		t.Errorf("expected genres 'tamil pop', got %q", resp.Metadata["genres"])
+	}
+	if resp.Metadata["copyrights"] != "© 2022 Raaj Kamal Films International" {
+		t.Errorf("expected copyrights, got %q", resp.Metadata["copyrights"])
+	}
+}
+

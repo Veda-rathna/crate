@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -247,16 +248,39 @@ func mapMBRecordType(primary string, secondary []string) string {
 	}
 }
 
+func joinUniqueStrings(items ...string) string {
+	seen := make(map[string]struct{}, len(items))
+	var out []string
+	for _, item := range items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return strings.Join(out, ", ")
+}
+
 func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumDetail, error) {
 	type mbRelease struct {
 		ID     string `json:"id"`
 		Date   string `json:"date"`
 		Status string `json:"status"`
 	}
+	type mbTag struct {
+		Name string `json:"name"`
+	}
 	var rgResp struct {
 		ID           string      `json:"id"`
 		Title        string      `json:"title"`
 		Releases     []mbRelease `json:"releases"`
+		Genres       []mbTag     `json:"genres"`
+		Tags         []mbTag     `json:"tags"`
 		ArtistCredit []struct {
 			Artist struct {
 				Name string `json:"name"`
@@ -265,7 +289,7 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		FirstReleaseDate string `json:"first-release-date"`
 	}
 
-	if err := s.get(ctx, "/release-group/"+req.Id+"?inc=releases+artist-credits&fmt=json", &rgResp); err != nil {
+	if err := s.get(ctx, "/release-group/"+req.Id+"?inc=releases+artist-credits+genres+tags&fmt=json", &rgResp); err != nil {
 		return nil, err
 	}
 
@@ -289,41 +313,104 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		}
 	}
 
+	var rgGenres []string
+	for _, g := range rgResp.Genres {
+		rgGenres = append(rgGenres, g.Name)
+	}
+	var rgTags []string
+	for _, t := range rgResp.Tags {
+		rgTags = append(rgTags, t.Name)
+	}
+
+	type mbWorkRel struct {
+		TargetType string `json:"target-type"`
+		Work       struct {
+			Language  string   `json:"language"`
+			Languages []string `json:"languages"`
+		} `json:"work"`
+	}
+
 	var tracks []*pb.TrackInfo
 	albumMetadata := map[string]string{}
+	if v := joinUniqueStrings(rgGenres...); v != "" {
+		albumMetadata["genres"] = v
+	}
+	if v := joinUniqueStrings(rgTags...); v != "" {
+		albumMetadata["tags"] = v
+	}
+
 	maxAttempts := 3
 	if len(ordered) < maxAttempts {
 		maxAttempts = len(ordered)
 	}
 	for i := 0; i < maxAttempts; i++ {
 		var relResp struct {
+			Barcode            string `json:"barcode"`
 			TextRepresentation struct {
 				Language string `json:"language"`
 				Script   string `json:"script"`
 			} `json:"text-representation"`
-			Media []struct {
+			LabelInfo []struct {
+				Label struct {
+					Name string `json:"name"`
+				} `json:"label"`
+			} `json:"label-info"`
+			Genres []mbTag `json:"genres"`
+			Tags   []mbTag `json:"tags"`
+			Media  []struct {
 				Position int `json:"position"`
 				Tracks   []struct {
-					ID       string `json:"id"`
-					Title    string `json:"title"`
-					Number   string `json:"number"`
-					Position int    `json:"position"`
-					Length   int    `json:"length"`
+					ID        string      `json:"id"`
+					Title     string      `json:"title"`
+					Number    string      `json:"number"`
+					Position  int         `json:"position"`
+					Length    int         `json:"length"`
+					Relations []mbWorkRel `json:"relations"`
+					Recording struct {
+						Relations []mbWorkRel `json:"relations"`
+					} `json:"recording"`
 				} `json:"tracks"`
 			} `json:"media"`
 		}
 
-		if err := s.get(ctx, "/release/"+ordered[i].ID+"?inc=recordings&fmt=json", &relResp); err != nil {
+		if err := s.get(ctx, "/release/"+ordered[i].ID+"?inc=recordings+recording-level-rels+work-rels+labels+genres+tags&fmt=json", &relResp); err != nil {
 			continue
 		}
 
 		var candidateTracks []*pb.TrackInfo
+		var albumWorkLangs []string
 		for _, media := range relResp.Media {
 			for _, t := range media.Tracks {
 				trackNum, _ := strconv.Atoi(t.Number)
 				if trackNum == 0 {
 					trackNum = t.Position
 				}
+				var trackWorkLangs []string
+				collectRels := func(rels []mbWorkRel) {
+					for _, rel := range rels {
+						if rel.TargetType != "" && rel.TargetType != "work" {
+							continue
+						}
+						trackWorkLangs = append(trackWorkLangs, rel.Work.Languages...)
+						if rel.Work.Language != "" {
+							trackWorkLangs = append(trackWorkLangs, rel.Work.Language)
+						}
+					}
+				}
+				collectRels(t.Recording.Relations)
+				collectRels(t.Relations)
+				albumWorkLangs = append(albumWorkLangs, trackWorkLangs...)
+
+				var trackMeta map[string]string
+				if joined := joinUniqueStrings(trackWorkLangs...); joined != "" {
+					trackMeta = map[string]string{"work_languages": joined}
+					// Set single clean language if unambiguous so TrackInfo metadata stays simple.
+					parts := strings.Split(joined, ",")
+					if len(parts) == 1 {
+						trackMeta["language"] = strings.TrimSpace(parts[0])
+					}
+				}
+
 				candidateTracks = append(candidateTracks, &pb.TrackInfo{
 					Id:          t.ID,
 					Title:       t.Title,
@@ -331,6 +418,7 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 					DiscNumber:  int32(media.Position),
 					DurationMs:  int32(t.Length),
 					Rank:        int32(t.Position),
+					Metadata:    trackMeta,
 				})
 			}
 		}
@@ -340,9 +428,40 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 			albumMetadata = map[string]string{}
 			if relResp.TextRepresentation.Language != "" {
 				albumMetadata["language"] = relResp.TextRepresentation.Language
+				albumMetadata["text_language"] = relResp.TextRepresentation.Language
 			}
 			if relResp.TextRepresentation.Script != "" {
 				albumMetadata["script"] = relResp.TextRepresentation.Script
+				albumMetadata["text_script"] = relResp.TextRepresentation.Script
+			}
+			if bc := strings.TrimSpace(relResp.Barcode); bc != "" {
+				albumMetadata["upc"] = bc
+			}
+			var labels []string
+			for _, li := range relResp.LabelInfo {
+				if li.Label.Name != "" {
+					labels = append(labels, li.Label.Name)
+				}
+			}
+			if v := joinUniqueStrings(labels...); v != "" {
+				albumMetadata["label"] = v
+			}
+			allGenres := append([]string{}, rgGenres...)
+			for _, g := range relResp.Genres {
+				allGenres = append(allGenres, g.Name)
+			}
+			if v := joinUniqueStrings(allGenres...); v != "" {
+				albumMetadata["genres"] = v
+			}
+			allTags := append([]string{}, rgTags...)
+			for _, tg := range relResp.Tags {
+				allTags = append(allTags, tg.Name)
+			}
+			if v := joinUniqueStrings(allTags...); v != "" {
+				albumMetadata["tags"] = v
+			}
+			if v := joinUniqueStrings(albumWorkLangs...); v != "" {
+				albumMetadata["work_languages"] = v
 			}
 		}
 		if len(tracks) > 0 {

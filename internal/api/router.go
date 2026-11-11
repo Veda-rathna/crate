@@ -14,6 +14,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/cache"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/importer"
@@ -21,40 +22,55 @@ import (
 )
 
 type Server struct {
-	queries     *db.Queries
-	providers   *provider.Manager
-	cache       *cache.Cache
-	downloader  *downloader.Service
-	activityLog *activity.Log
-	importer    *importer.Service
-	reject      *reject.Service
-	router      chi.Router
-	frontendFS  fs.FS
-	bgWork      sync.WaitGroup
-	tasksMu     sync.Mutex
-	tasks       map[string]*BackgroundTask
-	startTime   time.Time
-	libraryDir  string
-	version     string
+	queries      *db.Queries
+	providers    *provider.Manager
+	cache        *cache.Cache
+	downloader   *downloader.Service
+	activityLog  *activity.Log
+	importer     *importer.Service
+	reject       *reject.Service
+	langResolver *language.Resolver
+	router       chi.Router
+	frontendFS   fs.FS
+	bgWork       sync.WaitGroup
+	tasksMu      sync.Mutex
+	tasks        map[string]*BackgroundTask
+	startTime    time.Time
+	libraryDir   string
+	version      string
 }
 
 func NewServer(queries *db.Queries, providers *provider.Manager, c *cache.Cache, dl *downloader.Service, actLog *activity.Log, frontendFS fs.FS, libraryDir string, version string) *Server {
+	var cacheStore language.CacheStore
+	if c != nil {
+		cacheStore = c
+	}
+	var settingsReader language.SettingsReader
+	if queries != nil {
+		settingsReader = queries
+	}
 	s := &Server{
-		queries:     queries,
-		providers:   providers,
-		cache:       c,
-		downloader:  dl,
-		activityLog: actLog,
-		importer:    importer.NewService(queries, libraryDir, actLog),
-		reject:      reject.NewService(queries, libraryDir, actLog),
-		frontendFS:  frontendFS,
-		tasks:       make(map[string]*BackgroundTask),
-		startTime:   time.Now().UTC(),
-		libraryDir:  libraryDir,
-		version:     version,
+		queries:      queries,
+		providers:    providers,
+		cache:        c,
+		downloader:   dl,
+		activityLog:  actLog,
+		importer:     importer.NewService(queries, libraryDir, actLog),
+		reject:       reject.NewService(queries, libraryDir, actLog),
+		langResolver: language.NewResolver(cacheStore, settingsReader),
+		frontendFS:   frontendFS,
+		tasks:        make(map[string]*BackgroundTask),
+		startTime:    time.Now().UTC(),
+		libraryDir:   libraryDir,
+		version:      version,
 	}
 	s.router = s.setupRouter()
 	return s
+}
+
+// SetLanguageResolver replaces the server's language resolver (e.g. for tests with mock endpoints).
+func (s *Server) SetLanguageResolver(r *language.Resolver) {
+	s.langResolver = r
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

@@ -20,21 +20,51 @@ import (
 )
 
 type Service struct {
-	queries     *db.Queries
-	providers   *provider.Manager
-	activityLog *activity.Log
-	libraryDir  string
-	interval    time.Duration
+	queries      *db.Queries
+	providers    *provider.Manager
+	activityLog  *activity.Log
+	langResolver *language.Resolver
+	libraryDir   string
+	interval     time.Duration
 }
 
 func NewService(queries *db.Queries, providers *provider.Manager, actLog *activity.Log, libraryDir string, interval time.Duration) *Service {
-	return &Service{
-		queries:     queries,
-		providers:   providers,
-		activityLog: actLog,
-		libraryDir:  libraryDir,
-		interval:    interval,
+	var cacheStore language.CacheStore
+	if providers != nil && providers.Cache() != nil {
+		cacheStore = providers.Cache()
 	}
+	var settingsReader language.SettingsReader
+	if queries != nil {
+		settingsReader = queries
+	}
+	return &Service{
+		queries:      queries,
+		providers:    providers,
+		activityLog:  actLog,
+		langResolver: language.NewResolver(cacheStore, settingsReader),
+		libraryDir:   libraryDir,
+		interval:     interval,
+	}
+}
+
+// SetLanguageResolver overrides the language resolver (primarily for tests).
+func (s *Service) SetLanguageResolver(r *language.Resolver) {
+	s.langResolver = r
+}
+
+func (s *Service) languageResolver() *language.Resolver {
+	if s.langResolver != nil {
+		return s.langResolver
+	}
+	var cacheStore language.CacheStore
+	if s.providers != nil && s.providers.Cache() != nil {
+		cacheStore = s.providers.Cache()
+	}
+	var settingsReader language.SettingsReader
+	if s.queries != nil {
+		settingsReader = s.queries
+	}
+	return language.NewResolver(cacheStore, settingsReader)
 }
 
 func (s *Service) Run(ctx context.Context) {
@@ -122,10 +152,11 @@ func (s *Service) DetectNewReleases(ctx context.Context) {
 				}
 			}
 
+			resolver := s.languageResolver()
+
 			// Check artist language preference on candidate release
 			if !language.IsAllLanguages(artist.Languages) {
-				summaryLang := language.DetectReleaseSummaryLanguage(pa.Title, pa.Metadata)
-				if summaryLang != language.Unknown && !language.MatchesArtistLanguages(artist.Languages, summaryLang) {
+				if allowed, summaryLang := resolver.MatchesSummary(artist.Languages, pa.Title, pa.Metadata); !allowed {
 					slog.Info("scheduler: skipping release due to language preference",
 						"artist", artist.Name, "album", pa.Title, "language", summaryLang, "preferences", artist.Languages)
 					continue
@@ -139,8 +170,7 @@ func (s *Service) DetectNewReleases(ctx context.Context) {
 			}
 
 			if !language.IsAllLanguages(artist.Languages) {
-				detailLang := language.DetectAlbumDetailLanguage(albumDetail)
-				if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+				if allowed, detailLang := resolver.CheckAlbum(ctx, artist.Name, artist.Languages, albumDetail); !allowed {
 					slog.Info("scheduler: skipping release due to language preference",
 						"artist", artist.Name, "album", pa.Title, "language", detailLang, "preferences", artist.Languages)
 					continue
@@ -201,8 +231,7 @@ func (s *Service) healAlbumTracks(ctx context.Context, artist *models.Artist, ex
 		return
 	}
 	if !language.IsAllLanguages(artist.Languages) {
-		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
-		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+		if allowed, _ := s.languageResolver().CheckAlbum(ctx, artist.Name, artist.Languages, albumDetail); !allowed {
 			_ = s.queries.UpdateAlbumStatus(existing.ID, models.AlbumStatusIgnored)
 			return
 		}

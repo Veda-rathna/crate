@@ -52,6 +52,14 @@ func NewManager(cache *cache.Cache, queries *db.Queries) *Manager {
 	}
 }
 
+// Cache returns the backing cache instance, or nil if caching is disabled.
+func (m *Manager) Cache() *cache.Cache {
+	if m == nil {
+		return nil
+	}
+	return m.cache
+}
+
 func (m *Manager) RegisterProvider(ctx context.Context, name, address string) error {
 	if name == LocalProvider {
 		return fmt.Errorf("provider name %q is reserved for imported library entries", LocalProvider)

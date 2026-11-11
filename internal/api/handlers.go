@@ -704,6 +704,21 @@ func (s *Server) syncAlbumTracks(ctx context.Context, providerName string, album
 	}
 }
 
+func (s *Server) languageResolver() *language.Resolver {
+	if s.langResolver != nil {
+		return s.langResolver
+	}
+	var cacheStore language.CacheStore
+	if s.cache != nil {
+		cacheStore = s.cache
+	}
+	var settingsReader language.SettingsReader
+	if s.queries != nil {
+		settingsReader = s.queries
+	}
+	return language.NewResolver(cacheStore, settingsReader)
+}
+
 func (s *Server) saveAlbumFromProvider(ctx context.Context, providerName string, artistID int64, pa *pb.AlbumSummary) {
 	s.saveAlbumFromProviderWithOptions(ctx, providerName, artistID, pa, false)
 }
@@ -712,10 +727,10 @@ func (s *Server) saveAlbumFromProviderWithOptions(ctx context.Context, providerN
 	artist, _ := s.queries.GetArtist(artistID)
 	albumStatus := models.AlbumStatusWatched
 	trackStatus := models.TrackStatusWanted
+	resolver := s.languageResolver()
 
 	if artist != nil && !language.IsAllLanguages(artist.Languages) {
-		summaryLang := language.DetectReleaseSummaryLanguage(pa.Title, pa.Metadata)
-		if summaryLang != language.Unknown && !language.MatchesArtistLanguages(artist.Languages, summaryLang) {
+		if allowed, _ := resolver.MatchesSummary(artist.Languages, pa.Title, pa.Metadata); !allowed {
 			albumStatus = models.AlbumStatusIgnored
 			trackStatus = models.TrackStatusIgnored
 		}
@@ -734,8 +749,7 @@ func (s *Server) saveAlbumFromProviderWithOptions(ctx context.Context, providerN
 	}
 
 	if artist != nil && !language.IsAllLanguages(artist.Languages) && albumStatus == models.AlbumStatusWatched {
-		detailLang := language.DetectAlbumDetailLanguage(albumDetail)
-		if !language.MatchesArtistLanguages(artist.Languages, detailLang) {
+		if allowed, _ := resolver.CheckAlbum(ctx, artist.Name, artist.Languages, albumDetail); !allowed {
 			albumStatus = models.AlbumStatusIgnored
 			trackStatus = models.TrackStatusIgnored
 		}
@@ -1548,6 +1562,7 @@ var sensitiveSettings = map[string]bool{
 	"arcod_password":        true,
 	"arcod_token":           true,
 	"spotify_client_secret": true,
+	"lang_llm_api_key":      true,
 }
 
 var hiddenSettings = map[string]bool{
@@ -1601,9 +1616,16 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			settings["download_source_priority"] = string(b)
 		}
 	}
-	for _, boolKey := range []string{"arcod_enabled", "slskd_enabled"} {
+	for _, boolKey := range []string{"arcod_enabled", "slskd_enabled", "lang_allow_unknown", "lang_llm_enabled"} {
 		if v, ok := settings[boolKey]; ok && v != "" && v != "true" && v != "false" {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid %s: must be 'true' or 'false'", boolKey))
+			return
+		}
+	}
+	if v, ok := settings["lang_llm_url"]; ok && strings.TrimSpace(v) != "" {
+		lower := strings.ToLower(strings.TrimSpace(v))
+		if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			writeError(w, http.StatusBadRequest, "invalid lang_llm_url: must start with http:// or https://")
 			return
 		}
 	}

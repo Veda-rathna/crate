@@ -117,6 +117,29 @@ const SLSKD_FIELDS: FieldDef[] = [
   },
 ];
 
+const LANGUAGE_LLM_FIELDS: FieldDef[] = [
+  {
+    key: 'lang_llm_url',
+    label: 'OpenAI-Compatible API Base URL',
+    placeholder: 'https://api.openai.com/v1',
+    description:
+      'Works with OpenAI, Groq (https://api.groq.com/openai/v1), Gemini OpenAI endpoint, or OpenRouter',
+  },
+  {
+    key: 'lang_llm_api_key',
+    label: 'API Key',
+    placeholder: 'sk-...',
+    type: 'password',
+    description: 'Bearer token stored locally and redacted when read',
+  },
+  {
+    key: 'lang_llm_model',
+    label: 'Model Name',
+    placeholder: 'gpt-4o-mini',
+    description: 'Lightweight text model used only when metadata + Apple Music are inconclusive',
+  },
+];
+
 const INTEGRATION_SECTIONS: { title: string; fields: FieldDef[] }[] = [
   {
     title: 'Spotify Provider (Optional)',
@@ -259,6 +282,8 @@ export default function Settings() {
           ...settings,
           arcod_enabled: settings.arcod_enabled ?? 'true',
           slskd_enabled: settings.slskd_enabled ?? 'true',
+          lang_allow_unknown: settings.lang_allow_unknown ?? 'false',
+          lang_llm_enabled: settings.lang_llm_enabled ?? 'false',
           download_source_priority: JSON.stringify(parsedSources),
           quality_tiers: JSON.stringify(parsedTiers),
           quality_fallback_enabled: settings.quality_fallback_enabled ?? 'true',
@@ -274,6 +299,8 @@ export default function Settings() {
         ...form,
         arcod_enabled: form.arcod_enabled ?? 'true',
         slskd_enabled: form.slskd_enabled ?? 'true',
+        lang_allow_unknown: form.lang_allow_unknown ?? 'false',
+        lang_llm_enabled: form.lang_llm_enabled ?? 'false',
         download_source_priority: JSON.stringify(sourcePriority),
         quality_tiers: JSON.stringify(tiers),
         quality_fallback_enabled: form.quality_fallback_enabled ?? 'true',
@@ -323,6 +350,8 @@ export default function Settings() {
         ...form,
         arcod_enabled: form.arcod_enabled ?? 'true',
         slskd_enabled: form.slskd_enabled ?? 'true',
+        lang_allow_unknown: form.lang_allow_unknown ?? 'false',
+        lang_llm_enabled: form.lang_llm_enabled ?? 'false',
         download_source_priority: JSON.stringify(sourcePriority),
         quality_tiers: JSON.stringify(tiers),
         quality_fallback_enabled: form.quality_fallback_enabled ?? 'true',
@@ -500,6 +529,91 @@ export default function Settings() {
                 </option>
               ))}
             </select>
+          </div>
+        </SettingsSection>
+      )}
+
+      {/* Language Detection Accuracy */}
+      {showSection('providers') && (
+        <SettingsSection
+          title="Language Detection & Filtering"
+          description="Combines provider work languages & genres, Apple Music India lookups, and an optional lightweight AI tie-breaker — cached so your server uses near-zero CPU."
+        >
+          <div className="space-y-3">
+            <label className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl px-3.5 py-3 cursor-pointer">
+              <div>
+                <p className="text-sm font-medium text-zinc-100">
+                  Allow unlabelled releases &amp; tracks
+                </p>
+                <p className="text-[11px] text-zinc-400">
+                  Recommended if originals lack language tags: still blocks confirmed dubs (e.g. Telugu, Hindi), while allowing releases &amp; Soulseek files whose language cannot be confirmed.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={form.lang_allow_unknown === 'true'}
+                onClick={() =>
+                  setForm({
+                    ...form,
+                    lang_allow_unknown: form.lang_allow_unknown === 'true' ? 'false' : 'true',
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition-colors ${
+                  form.lang_allow_unknown === 'true' ? 'bg-emerald-500' : 'bg-zinc-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-5 w-5 rounded-full bg-white shadow transform transition-transform mt-0.5 ${
+                    form.lang_allow_unknown === 'true' ? 'translate-x-[22px]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </label>
+
+            <label className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl px-3.5 py-3 cursor-pointer">
+              <div>
+                <p className="text-sm font-medium text-zinc-100">
+                  Enable Cloud AI Tie-Breaker (Optional)
+                </p>
+                <p className="text-[11px] text-zinc-400">
+                  Only called over HTTPS when MusicBrainz/Deezer/Spotify and Apple Music India return unknown; verdicts are cached for 30 days.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={form.lang_llm_enabled === 'true'}
+                onClick={() =>
+                  setForm({
+                    ...form,
+                    lang_llm_enabled: form.lang_llm_enabled === 'true' ? 'false' : 'true',
+                  })
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition-colors ${
+                  form.lang_llm_enabled === 'true' ? 'bg-emerald-500' : 'bg-zinc-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-5 w-5 rounded-full bg-white shadow transform transition-transform mt-0.5 ${
+                    form.lang_llm_enabled === 'true' ? 'translate-x-[22px]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </label>
+
+            {form.lang_llm_enabled === 'true' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                {LANGUAGE_LLM_FIELDS.map((field) => (
+                  <SettingInput
+                    key={field.key}
+                    field={field}
+                    value={form[field.key] || ''}
+                    onChange={(v) => setForm({ ...form, [field.key]: v })}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         </SettingsSection>
       )}

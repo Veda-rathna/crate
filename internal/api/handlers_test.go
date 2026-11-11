@@ -16,12 +16,14 @@ import (
 	"time"
 
 	id3v2 "github.com/bogem/id3v2/v2"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/api"
 	"github.com/TheOutdoorProgrammer/crate/internal/cache"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
@@ -3015,5 +3017,96 @@ func TestRelinkArtistHonorsExplicitProviderAndSyncs(t *testing.T) {
 	albums, _ := env.queries.ListAlbumsByArtist(artist.ID)
 	if len(albums) != 1 || albums[0].Provider != "deezer" || albums[0].ProviderID != "dz-new" {
 		t.Fatalf("expected deezer discography synced after relink, got %+v", albums)
+	}
+}
+
+func TestSettingsLanguageOptionsAndSyncResolver(t *testing.T) {
+	dp := &dynamicProvider{
+		artistName: "Anirudh Ravichander",
+		albums: []*pb.AlbumSummary{
+			{Id: "al-tam", Title: `Aaja Raja (From "KH x RK Reunion")`, Year: 2026, RecordType: "single", Metadata: map[string]string{"release_date": "2026-11-10"}},
+			{Id: "al-tel", Title: "Leo - Telugu", Year: 2023, RecordType: "album", Metadata: map[string]string{"release_date": "2023-10-19"}},
+		},
+		albumMap: map[string]*pb.AlbumDetail{
+			"al-tam": {
+				Id:         "al-tam",
+				Title:      `Aaja Raja (From "KH x RK Reunion")`,
+				ArtistName: "Anirudh Ravichander",
+				Year:       2026,
+				Metadata:   map[string]string{"text_language": "eng", "text_script": "Latn", "language": "eng", "script": "Latn", "upc": "8901234567890"},
+				Tracks:     []*pb.TrackInfo{{Id: "t-tam", Title: "Aaja Raja", TrackNumber: 1, DiscNumber: 1}},
+			},
+			"al-tel": {
+				Id:         "al-tel",
+				Title:      "Leo - Telugu",
+				ArtistName: "Anirudh Ravichander",
+				Year:       2023,
+				Tracks:     []*pb.TrackInfo{{Id: "t-tel", Title: "Badass - Telugu", TrackNumber: 1, DiscNumber: 1}},
+			},
+		},
+	}
+	env := newDynamicEnv(t, map[string]*dynamicProvider{"musicbrainz": dp}, "musicbrainz")
+
+	// Validate bad settings rejected cleanly.
+	if w := env.do("PUT", "/api/settings", `{"lang_allow_unknown": "maybe"}`); w.Code != 400 {
+		t.Fatalf("expected 400 for invalid lang_allow_unknown, got %d", w.Code)
+	}
+	if w := env.do("PUT", "/api/settings", `{"lang_llm_url": "ftp://bad-scheme"}`); w.Code != 400 {
+		t.Fatalf("expected 400 for invalid lang_llm_url, got %d", w.Code)
+	}
+
+	// Save valid LLM settings and verify API key redaction + preservation.
+	if w := env.do("PUT", "/api/settings", `{"lang_allow_unknown": "false", "lang_llm_enabled": "true", "lang_llm_url": "https://api.example.com/v1", "lang_llm_model": "gpt-4o-mini", "lang_llm_api_key": "super-secret"}`); w.Code != 200 {
+		t.Fatalf("expected 200 saving language settings, got %d: %s", w.Code, w.Body.String())
+	}
+	gotSettings := decode[map[string]string](t, env.do("GET", "/api/settings", ""))
+	if gotSettings["lang_llm_api_key"] != "••••••••" {
+		t.Errorf("expected redacted lang_llm_api_key, got %q", gotSettings["lang_llm_api_key"])
+	}
+
+	fakeITunes := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resultCount": 1,
+			"results": []map[string]any{
+				{
+					"wrapperType":      "collection",
+					"artistName":       "Anirudh Ravichander",
+					"collectionName":   `Aaja Raja (From "KH x RK Reunion") - Single`,
+					"primaryGenreName": "Tamil",
+				},
+			},
+		})
+	}))
+	defer fakeITunes.Close()
+
+	env.server.SetLanguageResolver(language.NewResolver(nil, env.queries, language.ResolverConfig{
+		ITunesBaseURL: fakeITunes.URL,
+		ITunesLimiter: rate.NewLimiter(rate.Inf, 10),
+	}))
+
+	artist := &models.Artist{
+		Name:       "Anirudh Ravichander",
+		Provider:   "musicbrainz",
+		ProviderID: "art-ani",
+		Status:     models.ArtistStatusWatched,
+		Languages:  []string{language.Tamil},
+	}
+	if err := env.queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	w := env.do("POST", fmt.Sprintf("/api/artists/%d/sync", artist.ID), "")
+	if w.Code != 202 {
+		t.Fatalf("expected 202 from sync, got %d: %s", w.Code, w.Body.String())
+	}
+
+	albums, _ := env.queries.ListAlbumsByArtist(artist.ID)
+	tam := findAlbumByTitle(t, albums, `Aaja Raja (From "KH x RK Reunion")`)
+	if tam.Status != models.AlbumStatusWatched {
+		t.Errorf("expected iTunes-verified Tamil release to be watched despite MB eng+Latn, got %s", tam.Status)
+	}
+	tel := findAlbumByTitle(t, albums, "Leo - Telugu")
+	if tel.Status != models.AlbumStatusIgnored {
+		t.Errorf("expected Telugu dub to be ignored for Tamil artist, got %s", tel.Status)
 	}
 }

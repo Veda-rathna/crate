@@ -405,3 +405,81 @@ func TestMusicBrainzGetAlbumPrefersOfficialRelease(t *testing.T) {
 		t.Fatalf("expected tracks from Official release, got %+v", resp.Tracks)
 	}
 }
+
+func TestMusicBrainzGetAlbumRichMetadata(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/release-group/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":                 "rg-tamil",
+			"title":              "Jailer",
+			"first-release-date": "2023-08-10",
+			"genres":             []map[string]any{{"name": "filmi"}},
+			"tags":               []map[string]any{{"name": "tamil"}, {"name": "kollywood"}},
+			"releases":           []map[string]any{{"id": "rel-tamil", "status": "Official"}},
+		})
+	})
+	mux.HandleFunc("/release/rel-tamil", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"barcode": "8901234567890",
+			"text-representation": map[string]any{
+				"language": "eng",
+				"script":   "Latn",
+			},
+			"label-info": []map[string]any{
+				{"label": map[string]any{"name": "Sun Pictures"}},
+			},
+			"genres": []map[string]any{{"name": "tamil soundtrack"}},
+			"media": []map[string]any{
+				{
+					"position": 1,
+					"tracks": []map[string]any{
+						{
+							"id":       "t-1",
+							"title":    "Hukum",
+							"number":   "1",
+							"position": 1,
+							"length":   207000,
+							"recording": map[string]any{
+								"relations": []map[string]any{
+									{
+										"target-type": "work",
+										"work": map[string]any{
+											"languages": []string{"tam"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	})
+
+	fake := httptest.NewServer(mux)
+	defer fake.Close()
+	client := startTestServer(t, fake.URL)
+
+	resp, err := client.GetAlbum(context.Background(), &pb.EntityRequest{Id: "rg-tamil"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Metadata["upc"] != "8901234567890" {
+		t.Errorf("expected upc barcode, got %q", resp.Metadata["upc"])
+	}
+	if resp.Metadata["label"] != "Sun Pictures" {
+		t.Errorf("expected label Sun Pictures, got %q", resp.Metadata["label"])
+	}
+	if resp.Metadata["work_languages"] != "tam" {
+		t.Errorf("expected work_languages tam, got %q", resp.Metadata["work_languages"])
+	}
+	if resp.Metadata["tags"] != "tamil, kollywood" {
+		t.Errorf("expected tags 'tamil, kollywood', got %q", resp.Metadata["tags"])
+	}
+	if resp.Metadata["genres"] != "filmi, tamil soundtrack" {
+		t.Errorf("expected merged genres, got %q", resp.Metadata["genres"])
+	}
+	if resp.Tracks[0].Metadata["language"] != "tam" {
+		t.Errorf("expected track work language tam, got %+v", resp.Tracks[0].Metadata)
+	}
+}

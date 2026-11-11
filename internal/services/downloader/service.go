@@ -367,6 +367,9 @@ func (s *Service) getScoringConfig() scoringConfig {
 			cfg.negativeKeywords = keywords
 		}
 	}
+	if v, err := s.queries.GetSetting("lang_allow_unknown"); err == nil && strings.EqualFold(strings.TrimSpace(v), "true") {
+		cfg.allowUnknown = true
+	}
 	return cfg
 }
 
@@ -1255,7 +1258,7 @@ func scoreCandidates(results []slskd.SearchResult, track *models.Track, ac avail
 				}
 				if track != nil && !language.IsAllLanguages(track.ArtistLanguages) {
 					candLang := language.DetectCandidateFileLanguage(f.Filename, track.AlbumTitle, track.Title)
-					if !language.MatchesArtistLanguages(track.ArtistLanguages, candLang) {
+					if !language.MatchesArtistLanguagesWithPolicy(track.ArtistLanguages, candLang, cfg.allowUnknown) {
 						continue
 					}
 				}
@@ -1435,6 +1438,7 @@ type scoringConfig struct {
 	negativeKeywords []string
 	excludeNegative  bool
 	requireArtist    bool
+	allowUnknown     bool
 	// includeAll disables the title/artist/format filters so manual search can
 	// surface every file slskd returned (still scored and annotated, never dropped).
 	includeAll bool

@@ -239,3 +239,105 @@ func TestDetectAlbumDetailLanguage(t *testing.T) {
 	}
 }
 
+func TestDetectFromRichMetadataPrecedence(t *testing.T) {
+	// MusicBrainz Romanized Tamil soundtrack: text-representation is eng+Latn, but work_languages is tam
+	mbTamilRomanized := &pb.AlbumDetail{
+		Title: "Jailer",
+		Metadata: map[string]string{
+			"language":       "eng",
+			"script":         "Latn",
+			"text_language":  "eng",
+			"text_script":    "Latn",
+			"work_languages": "tam",
+			"genres":         "filmi",
+		},
+		Tracks: []*pb.TrackInfo{{Title: "Hukum"}},
+	}
+	if got := DetectAlbumDetailLanguage(mbTamilRomanized); got != Tamil {
+		t.Errorf("expected work_languages tam to override eng+Latn, got %q", got)
+	}
+	if IsAmbiguousEnglishMetadata(mbTamilRomanized) {
+		t.Error("did not expect album with work_languages tam to be treated as ambiguous English")
+	}
+
+	// Deezer/MB genres & tags beat eng+Latn
+	genreTagged := &pb.AlbumDetail{
+		Title: "Vikram",
+		Metadata: map[string]string{
+			"language":      "eng",
+			"script":        "Latn",
+			"text_language": "eng",
+			"text_script":   "Latn",
+			"genres":        "Filmi, Tamil Soundtrack",
+		},
+	}
+	if got := DetectAlbumDetailLanguage(genreTagged); got != Tamil {
+		t.Errorf("expected Tamil from genres, got %q", got)
+	}
+
+	// Conflicting genres return Unknown instead of guessing
+	if got := DetectFromMetadata(map[string]string{"genres": "Tamil, Telugu"}); got != Unknown {
+		t.Errorf("expected Unknown for conflicting genres, got %q", got)
+	}
+
+	// Explicit label language cue (T-Series Tamil, etc.)
+	if got := DetectFromMetadata(map[string]string{"label": "T-Series Tamil"}); got != Tamil {
+		t.Errorf("expected Tamil from label keyword, got %q", got)
+	}
+
+	// Ambiguous eng+Latn without work/genre/tag confirmation is flagged
+	ambiguous := &pb.AlbumDetail{
+		Title: "Aaja Raja",
+		Metadata: map[string]string{
+			"language":      "eng",
+			"script":        "Latn",
+			"text_language": "eng",
+			"text_script":   "Latn",
+			"label":         "Sony Music South",
+		},
+		Tracks: []*pb.TrackInfo{{Title: "Aaja Raja (From \"KH x RK Reunion\")"}},
+	}
+	if got := DetectAlbumDetailLanguage(ambiguous); got != English {
+		t.Errorf("expected fallback English, got %q", got)
+	}
+	if !IsAmbiguousEnglishMetadata(ambiguous) {
+		t.Error("expected eng+Latn without work/genre/tag to be flagged as ambiguous English")
+	}
+}
+
+func TestStructuredSuffixAndDubTags(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"Badass - Telugu", Telugu},
+		{`Aaja Raja (From "KH x RK Reunion") - Hindi`, Hindi},
+		{"Hukum - Kannada Dub", Kannada},
+		{"Leo | Malayalam", Malayalam},
+		{"Kaavaalaa - Tamil Version", Tamil},
+		{"Spider-Man - Across the Spider-Verse", Unknown},
+		{"Non-English Track", Unknown},
+		{"English Vinglish", Unknown},
+		{"Hindi Medium", Unknown},
+		{"Tamil Anthem (Original)", Unknown},
+	}
+	for _, tt := range tests {
+		got := DetectStructuredTags(tt.input)
+		if got != tt.want {
+			t.Errorf("DetectStructuredTags(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestMatchesArtistLanguagesWithPolicy(t *testing.T) {
+	if MatchesArtistLanguagesWithPolicy([]string{"tamil"}, Unknown, false) {
+		t.Error("strict policy must reject Unknown")
+	}
+	if !MatchesArtistLanguagesWithPolicy([]string{"tamil"}, Unknown, true) {
+		t.Error("permissive policy must allow Unknown")
+	}
+	if MatchesArtistLanguagesWithPolicy([]string{"tamil"}, Telugu, true) {
+		t.Error("permissive policy must still block confirmed Telugu")
+	}
+}
+

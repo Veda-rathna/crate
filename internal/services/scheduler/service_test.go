@@ -2,16 +2,21 @@ package scheduler_test
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
 	"github.com/TheOutdoorProgrammer/crate/internal/activity"
 	"github.com/TheOutdoorProgrammer/crate/internal/cache"
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
+	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/scheduler"
@@ -20,9 +25,10 @@ import (
 
 type fakeSchedProvider struct {
 	pb.UnimplementedMusicProviderServer
-	mu     sync.Mutex
-	albums []*pb.AlbumSummary
-	tracks map[string][]*pb.TrackInfo
+	mu           sync.Mutex
+	albums       []*pb.AlbumSummary
+	tracks       map[string][]*pb.TrackInfo
+	albumDetails map[string]*pb.AlbumDetail
 }
 
 func (f *fakeSchedProvider) Info(ctx context.Context, req *pb.InfoRequest) (*pb.InfoResponse, error) {
@@ -40,6 +46,9 @@ func (f *fakeSchedProvider) GetArtistAlbums(ctx context.Context, req *pb.EntityR
 func (f *fakeSchedProvider) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.AlbumDetail, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if detail, ok := f.albumDetails[req.Id]; ok {
+		return detail, nil
+	}
 	return &pb.AlbumDetail{
 		Id:     req.Id,
 		Title:  "Album " + req.Id,
@@ -201,6 +210,77 @@ func TestDetectNewReleases_WatchedArtistSyncsBackfillAndHealsEmptyAlbum(t *testi
 	healedTracks, _ := q.ListTracksByAlbum(healed.ID)
 	if len(healedTracks) != 1 || healedTracks[0].Title != "Healed Track" {
 		t.Errorf("expected healed track on al-empty, got %+v", healedTracks)
+	}
+}
+
+func TestDetectNewReleases_LanguageResolverEnrichesTamilAndSkipsDubs(t *testing.T) {
+	fp := &fakeSchedProvider{
+		albums: []*pb.AlbumSummary{
+			{Id: "al-tam", Title: `Aaja Raja (From "KH x RK Reunion")`, Year: 2026, RecordType: "single", Metadata: map[string]string{"release_date": "2026-11-11"}},
+			{Id: "al-hin", Title: `Aaja Raja (From "KH x RK Reunion") - Hindi`, Year: 2026, RecordType: "single", Metadata: map[string]string{"release_date": "2026-11-11"}},
+		},
+		albumDetails: map[string]*pb.AlbumDetail{
+			"al-tam": {
+				Id:         "al-tam",
+				Title:      `Aaja Raja (From "KH x RK Reunion")`,
+				ArtistName: "Anirudh Ravichander",
+				Year:       2026,
+				Metadata:   map[string]string{"text_language": "eng", "text_script": "Latn", "language": "eng", "script": "Latn"},
+				Tracks:     []*pb.TrackInfo{{Id: "t-tam", Title: "Aaja Raja", TrackNumber: 1, DiscNumber: 1}},
+			},
+			"al-hin": {
+				Id:         "al-hin",
+				Title:      `Aaja Raja (From "KH x RK Reunion") - Hindi`,
+				ArtistName: "Anirudh Ravichander",
+				Year:       2026,
+				Tracks:     []*pb.TrackInfo{{Id: "t-hin", Title: "Aaja Raja - Hindi", TrackNumber: 1, DiscNumber: 1}},
+			},
+		},
+	}
+	svc, q, mgr := newTestScheduler(t, fp)
+
+	fakeITunes := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resultCount": 1,
+			"results": []map[string]any{
+				{
+					"wrapperType":      "collection",
+					"artistName":       "Anirudh Ravichander",
+					"collectionName":   `Aaja Raja (From "KH x RK Reunion") - Single`,
+					"primaryGenreName": "Tamil",
+				},
+			},
+		})
+	}))
+	defer fakeITunes.Close()
+
+	svc.SetLanguageResolver(language.NewResolver(mgr.Cache(), q, language.ResolverConfig{
+		ITunesBaseURL: fakeITunes.URL,
+		ITunesLimiter: rate.NewLimiter(rate.Inf, 10),
+	}))
+
+	since := "2026-11-01T00:00:00Z"
+	artist := &models.Artist{
+		Name:                  "Anirudh Ravichander",
+		Provider:              "test",
+		ProviderID:            "art-ani",
+		Status:                models.ArtistStatusWatched,
+		WatchNewReleases:      true,
+		WatchNewReleasesSince: &since,
+		Languages:             []string{language.Tamil},
+	}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.DetectNewReleases(context.Background())
+
+	albums, err := q.ListAlbumsByArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 1 || albums[0].ProviderID != "al-tam" {
+		t.Fatalf("expected only Tamil album al-tam added (Hindi dub skipped), got %+v", albums)
 	}
 }
 

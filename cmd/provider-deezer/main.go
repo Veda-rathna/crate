@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -222,7 +223,14 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		Title       string `json:"title"`
 		CoverMedium string `json:"cover_medium"`
 		ReleaseDate string `json:"release_date"`
-		Artist      struct {
+		UPC         string `json:"upc"`
+		Label       string `json:"label"`
+		Genres      struct {
+			Data []struct {
+				Name string `json:"name"`
+			} `json:"data"`
+		} `json:"genres"`
+		Artist struct {
 			Name string `json:"name"`
 		} `json:"artist"`
 	}
@@ -271,6 +279,36 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		})
 	}
 
+	meta := map[string]string{}
+	if upc := strings.TrimSpace(albumResp.UPC); upc != "" {
+		meta["upc"] = upc
+	}
+	if label := strings.TrimSpace(albumResp.Label); label != "" {
+		meta["label"] = label
+	}
+	if len(albumResp.Genres.Data) > 0 {
+		seen := make(map[string]struct{}, len(albumResp.Genres.Data))
+		var genreNames []string
+		for _, g := range albumResp.Genres.Data {
+			name := strings.TrimSpace(g.Name)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			genreNames = append(genreNames, name)
+		}
+		if len(genreNames) > 0 {
+			meta["genres"] = strings.Join(genreNames, ", ")
+		}
+	}
+	if len(meta) == 0 {
+		meta = nil
+	}
+
 	return &pb.AlbumDetail{
 		Id:         strconv.FormatInt(albumResp.ID, 10),
 		Title:      albumResp.Title,
@@ -278,6 +316,7 @@ func (s *server) GetAlbum(ctx context.Context, req *pb.EntityRequest) (*pb.Album
 		Year:       int32(year),
 		ArtistName: albumResp.Artist.Name,
 		Tracks:     tracks,
+		Metadata:   meta,
 	}, nil
 }
 
