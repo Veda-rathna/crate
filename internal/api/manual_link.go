@@ -2,8 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"regexp"
+	"strings"
 
+	"github.com/TheOutdoorProgrammer/crate/internal/matching"
 	"github.com/TheOutdoorProgrammer/crate/internal/models"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 )
@@ -80,11 +85,12 @@ func (s *Server) mergeAlbum(src, dst *models.Album) error {
 	used := make(map[int64]bool)
 	for i := range srcTracks {
 		t := &srcTracks[i]
-		if match := findWantedMatch(dstTracks, used, t); match != nil && t.FilePath != nil {
+		if match := findWantedMatch(dstTracks, used, t, len(srcTracks), len(dstTracks)); match != nil && t.FilePath != nil {
 			used[match.ID] = true
 			if err := s.queries.ClaimTrackFile(match.ID, *t.FilePath, strVal(t.DownloadFormat), intVal(t.DownloadBitrate), t.DurationMs, t.MBRecordingID); err != nil {
 				return err
 			}
+			_ = s.queries.DeletePendingDownloadByTrack(match.ID)
 			if err := s.queries.DeleteTrack(t.ID); err != nil {
 				return err
 			}
@@ -141,6 +147,7 @@ func (s *Server) handleLinkTrack(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to link track")
 		return
 	}
+	_ = s.queries.DeletePendingDownloadByTrack(dst.ID)
 	if err := s.queries.DeleteTrack(src.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to remove local duplicate")
 		return
@@ -148,24 +155,257 @@ func (s *Server) handleLinkTrack(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "linked", "claimed": dst.ID})
 }
 
-// findWantedMatch returns the wanted dst track that best matches src: an exact
-// title-fold match, preferring one whose disc/track number also aligns. Mirrors
-// the reconcile track matcher, but over DB rows and scoped to wanted tracks.
-func findWantedMatch(dst []models.Track, used map[int64]bool, src *models.Track) *models.Track {
-	var titleOnly *models.Track
-	for i := range dst {
-		d := &dst[i]
-		if used[d.ID] || d.Status != models.TrackStatusWanted || !foldEqual(d.Title, src.Title) {
-			continue
-		}
-		if d.TrackNumber == src.TrackNumber && d.DiscNumber == src.DiscNumber {
-			return d
-		}
-		if titleOnly == nil {
-			titleOnly = d
+// handleMatchUnmatchedAlbums automatically pairs and merges all unmatched local albums
+// under an artist with their corresponding provider albums based on title similarity,
+// track count alignment, and track numbers.
+func (s *Server) handleMatchUnmatchedAlbums(w http.ResponseWriter, r *http.Request) {
+	artistID, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid artist id")
+		return
+	}
+
+	artist, err := s.queries.GetArtist(artistID)
+	if err != nil || artist == nil {
+		writeError(w, http.StatusNotFound, "artist not found")
+		return
+	}
+	if artist.Provider == provider.LocalProvider {
+		writeError(w, http.StatusBadRequest, "cannot auto-match: artist is not linked to a provider")
+		return
+	}
+
+	albums, err := s.queries.ListAlbumsByArtist(artistID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list albums")
+		return
+	}
+
+	var locals []*models.Album
+	var targets []*models.Album
+	for i := range albums {
+		a := &albums[i]
+		if a.Provider == provider.LocalProvider {
+			locals = append(locals, a)
+		} else {
+			targets = append(targets, a)
 		}
 	}
-	return titleOnly
+
+	if len(locals) == 0 || len(targets) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"matched":   0,
+			"remaining": len(locals),
+		})
+		return
+	}
+
+	// Pre-load tracks for all candidates to avoid repeated queries
+	albumTracks := make(map[int64][]models.Track)
+	for _, a := range append(append([]*models.Album(nil), locals...), targets...) {
+		if tr, err := s.queries.ListTracksByAlbum(a.ID); err == nil {
+			albumTracks[a.ID] = tr
+		}
+	}
+
+	type matchCandidate struct {
+		local  *models.Album
+		target *models.Album
+		score  int
+	}
+
+	var candidates []matchCandidate
+	for _, loc := range locals {
+		for _, tgt := range targets {
+			score := scoreAlbumMatch(loc, albumTracks[loc.ID], tgt, albumTracks[tgt.ID])
+			if score >= 70 {
+				candidates = append(candidates, matchCandidate{
+					local:  loc,
+					target: tgt,
+					score:  score,
+				})
+			}
+		}
+	}
+
+	// Sort candidate matches highest score first
+	for i := 0; i < len(candidates)-1; i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].score > candidates[i].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+
+	usedLocals := make(map[int64]bool)
+	usedTargets := make(map[int64]bool)
+	matchedCount := 0
+
+	for _, cand := range candidates {
+		if usedLocals[cand.local.ID] || usedTargets[cand.target.ID] {
+			continue
+		}
+		if err := s.mergeAlbum(cand.local, cand.target); err != nil {
+			slog.Error("auto-match: merge album failed", "local_id", cand.local.ID, "target_id", cand.target.ID, "error", err)
+			continue
+		}
+		usedLocals[cand.local.ID] = true
+		usedTargets[cand.target.ID] = true
+		matchedCount++
+	}
+
+	if matchedCount > 0 {
+		s.recordActivity("albums_auto_matched", "artist", artistID,
+			fmt.Sprintf("Auto-matched %d album(s) for %s", matchedCount, artist.Name))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"matched":   matchedCount,
+		"remaining": len(locals) - matchedCount,
+	})
+}
+
+var (
+	albumQualifierRE   = regexp.MustCompile(`(?i)\s*[\(\[](?:[^\]\)]*(?:original motion picture soundtrack|motion picture soundtrack|soundtrack|original score|score|ost|deluxe|edition|single|ep|from\s+"[^"]*")[^\]\)]*)[\)\]]`)
+	albumTrailingRE    = regexp.MustCompile(`(?i)\s*[\-\x{2013}]\s*(?:original motion picture soundtrack|motion picture soundtrack|soundtrack|original score|score|ost|single|ep)\s*$`)
+	albumPunctRE       = regexp.MustCompile(`[^a-z0-9\p{L}]+`)
+)
+
+func cleanAlbumTitle(title string) string {
+	s := albumQualifierRE.ReplaceAllString(title, " ")
+	s = albumTrailingRE.ReplaceAllString(s, " ")
+	s = albumPunctRE.ReplaceAllString(strings.ToLower(s), " ")
+	return strings.TrimSpace(s)
+}
+
+func scoreAlbumMatch(loc *models.Album, locTracks []models.Track, tgt *models.Album, tgtTracks []models.Track) int {
+	score := 0
+
+	cleanLoc := cleanAlbumTitle(loc.Title)
+	cleanTgt := cleanAlbumTitle(tgt.Title)
+
+	if cleanLoc != "" && cleanLoc == cleanTgt {
+		score += 100
+	} else if foldEqual(loc.Title, tgt.Title) {
+		score += 100
+	} else if matching.TitlesMatch(loc.Title, tgt.Title) {
+		score += 70
+	} else if cleanLoc != "" && cleanTgt != "" && (strings.Contains(cleanLoc, cleanTgt) || strings.Contains(cleanTgt, cleanLoc)) {
+		score += 50
+	} else {
+		return 0 // Title has no similarity
+	}
+
+	// Track count alignment
+	lenLoc := len(locTracks)
+	lenTgt := len(tgtTracks)
+	if lenLoc > 0 && lenTgt > 0 {
+		if lenLoc == lenTgt {
+			score += 50
+		} else if abs(lenLoc-lenTgt) <= 2 {
+			score += 10
+		} else {
+			score -= 30
+		}
+	}
+
+	// Year compatibility
+	if loc.Year != nil && tgt.Year != nil && *loc.Year > 0 && *tgt.Year > 0 {
+		if *loc.Year == *tgt.Year {
+			score += 10
+		} else if abs(*loc.Year-*tgt.Year) > 1 {
+			score -= 20
+		}
+	}
+
+	return score
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// findWantedMatch returns the wanted dst track that best matches src using tiered matching:
+// 1. exact title fold + track/disc number
+// 2. exact title fold
+// 3. relaxed title match (matching.TitlesMatch) + track/disc number
+// 4. relaxed title match
+// 5. exact track & disc number when track counts align and duration is compatible
+// 6. single-track release match
+func findWantedMatch(dst []models.Track, used map[int64]bool, src *models.Track, totalSrc, totalDst int) *models.Track {
+	// Tier 1: exact title fold + disc/track number
+	for i := range dst {
+		d := &dst[i]
+		if used[d.ID] || d.Status != models.TrackStatusWanted {
+			continue
+		}
+		if foldEqual(d.Title, src.Title) && d.TrackNumber == src.TrackNumber && d.DiscNumber == src.DiscNumber {
+			return d
+		}
+	}
+
+	// Tier 2: exact title fold
+	for i := range dst {
+		d := &dst[i]
+		if used[d.ID] || d.Status != models.TrackStatusWanted {
+			continue
+		}
+		if foldEqual(d.Title, src.Title) {
+			return d
+		}
+	}
+
+	// Tier 3: relaxed title match + disc/track number
+	for i := range dst {
+		d := &dst[i]
+		if used[d.ID] || d.Status != models.TrackStatusWanted {
+			continue
+		}
+		if matching.TitlesMatch(d.Title, src.Title) && d.TrackNumber == src.TrackNumber && d.DiscNumber == src.DiscNumber {
+			return d
+		}
+	}
+
+	// Tier 4: relaxed title match
+	for i := range dst {
+		d := &dst[i]
+		if used[d.ID] || d.Status != models.TrackStatusWanted {
+			continue
+		}
+		if matching.TitlesMatch(d.Title, src.Title) {
+			return d
+		}
+	}
+
+	// Tier 5: track number and disc number alignment when total track count matches
+	if totalSrc > 0 && totalSrc == totalDst {
+		for i := range dst {
+			d := &dst[i]
+			if used[d.ID] || d.Status != models.TrackStatusWanted {
+				continue
+			}
+			if d.TrackNumber == src.TrackNumber && d.DiscNumber == src.DiscNumber {
+				if d.DurationMs <= 0 || src.DurationMs <= 0 || abs(d.DurationMs-src.DurationMs) <= 15000 {
+					return d
+				}
+			}
+		}
+	}
+
+	// Tier 6: Single-track release match
+	if totalSrc == 1 && totalDst == 1 {
+		for i := range dst {
+			d := &dst[i]
+			if !used[d.ID] && d.Status == models.TrackStatusWanted {
+				return d
+			}
+		}
+	}
+
+	return nil
 }
 
 func strVal(s *string) string {

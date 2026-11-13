@@ -156,6 +156,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ target_album_id: targetAlbumID }),
     }),
+  matchUnmatchedAlbums: (artistId: number) =>
+    request<{ matched: number; remaining: number }>(`/artists/${artistId}/match-unmatched`, {
+      method: 'POST',
+    }),
   linkTrack: (id: number, targetTrackID: number) =>
     request<{ status: string; claimed: number }>(`/tracks/${id}/link`, {
       method: 'POST',

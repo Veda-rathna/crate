@@ -901,6 +901,11 @@ func (q *Queries) DeleteDownload(id int64) error {
 	return err
 }
 
+func (q *Queries) DeletePendingDownloadByTrack(trackID int64) error {
+	_, err := q.db.Exec(`DELETE FROM download_queue WHERE track_id = ? AND status = 'pending'`, trackID)
+	return err
+}
+
 func (q *Queries) DeleteDownloadsByStatus(status string) (int64, error) {
 	result, err := q.db.Exec(`DELETE FROM download_queue WHERE status = ?`, status)
 	if err != nil {

@@ -123,6 +123,7 @@ func (s *Server) setupRouter() chi.Router {
 			r.Put("/{id}/new-releases", s.handleToggleNewReleases)
 			r.Put("/{id}/languages", s.handleUpdateArtistLanguages)
 			r.Post("/{id}/queue", s.handleQueueArtistTracks)
+			r.Post("/{id}/match-unmatched", s.handleMatchUnmatchedAlbums)
 			r.Delete("/{id}", s.handleUnwatchArtist)
 		})
 

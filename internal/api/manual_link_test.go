@@ -147,3 +147,64 @@ func TestLinkAlbumGuards(t *testing.T) {
 		t.Errorf("non-local source link status = %d, want 400", w.Code)
 	}
 }
+
+func TestMatchUnmatchedAlbums(t *testing.T) {
+	e := newTestEnv(t)
+	q := e.queries
+
+	artist := models.Artist{Name: "Anirudh Ravichander", Provider: "deezer", ProviderID: "12345", Status: models.ArtistStatusWatched}
+	if err := q.CreateArtist(&artist); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: Bracket qualifier difference: [Original Score] vs (Original Score)
+	provAlbum1 := seedProviderAlbum(t, q, artist.ID, "Karuppu - Side A (Just God Things) [Original Score]", "p-101", 2026)
+	seedWantedTrack(t, q, provAlbum1, "God Mode Begins", "pt-1", 1)
+	seedWantedTrack(t, q, provAlbum1, "The Reckoning", "pt-2", 2)
+
+	locAlbum1 := seedLocalAlbum(t, q, artist.ID, "Karuppu - Side A (Just God Things) (Original Score)", "loc-101", 2026)
+	seedOwnedLocalTrack(t, q, locAlbum1, "God Mode Begins", "lt-1", 1)
+	seedOwnedLocalTrack(t, q, locAlbum1, "The Reckoning", "lt-2", 2)
+
+	// Case 2: Exact title match with (From "...") single
+	provAlbum2 := seedProviderAlbum(t, q, artist.ID, "Karuppa Kooda Va (From \"Karuppu\")", "p-102", 2026)
+	seedWantedTrack(t, q, provAlbum2, "Karuppa Kooda Va", "pt-3", 1)
+
+	locAlbum2 := seedLocalAlbum(t, q, artist.ID, "Karuppa Kooda Va (From \"Karuppu\")", "loc-102", 2026)
+	seedOwnedLocalTrack(t, q, locAlbum2, "Karuppa Kooda Va", "lt-3", 1)
+
+	// Run auto-match
+	w := e.do("POST", fmt.Sprintf("/api/artists/%d/match-unmatched", artist.ID), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("match-unmatched status = %d, body %s", w.Code, w.Body.String())
+	}
+
+	// Verify local albums were merged into provider albums
+	if _, err := q.GetAlbum(locAlbum1); err == nil {
+		t.Errorf("locAlbum1 still exists, expected deleted")
+	}
+	if _, err := q.GetAlbum(locAlbum2); err == nil {
+		t.Errorf("locAlbum2 still exists, expected deleted")
+	}
+
+	// Provider albums should now have owned tracks
+	p1Tracks, err := q.ListTracksByAlbum(provAlbum1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range p1Tracks {
+		if tr.Status != models.TrackStatusOwned || tr.FilePath == nil {
+			t.Errorf("expected track %s to be owned with file, got %s", tr.Title, tr.Status)
+		}
+	}
+
+	p2Tracks, err := q.ListTracksByAlbum(provAlbum2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range p2Tracks {
+		if tr.Status != models.TrackStatusOwned || tr.FilePath == nil {
+			t.Errorf("expected track %s to be owned with file, got %s", tr.Title, tr.Status)
+		}
+	}
+}

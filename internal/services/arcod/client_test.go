@@ -345,3 +345,106 @@ func TestSearchRateLimitCooldownAndCache(t *testing.T) {
 	}
 }
 
+func TestFindBestTrackMatch_AlbumBatchCaching(t *testing.T) {
+	var searchCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/get-music" {
+			searchCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"tracks": map[string]any{
+						"total": 3,
+						"items": []map[string]any{
+							{
+								"id":                    101,
+								"title":                 "Hukum",
+								"duration":              200,
+								"maximum_bit_depth":     24,
+								"maximum_sampling_rate": 96.0,
+								"streamable":            true,
+								"performer":             map[string]any{"name": "Anirudh Ravichander"},
+								"album":                 map[string]any{"title": "Jailer"},
+							},
+							{
+								"id":                    102,
+								"title":                 "Kaavaalaa",
+								"duration":              190,
+								"maximum_bit_depth":     24,
+								"maximum_sampling_rate": 96.0,
+								"streamable":            true,
+								"performer":             map[string]any{"name": "Anirudh Ravichander"},
+								"album":                 map[string]any{"title": "Jailer"},
+							},
+							{
+								"id":                    103,
+								"title":                 "Jailer Theme",
+								"duration":              150,
+								"maximum_bit_depth":     24,
+								"maximum_sampling_rate": 96.0,
+								"streamable":            true,
+								"performer":             map[string]any{"name": "Anirudh Ravichander"},
+								"album":                 map[string]any{"title": "Jailer"},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client := NewClient(nil, "")
+	client.SetHTTPClient(ts.Client())
+	client.SetSearchLimiter(rate.NewLimiter(rate.Inf, 1))
+	t.Setenv("CRATE_ARCOD_URL", ts.URL)
+
+	// First track queries Arcod and populates album cache
+	t1, err := client.FindBestTrackMatch(context.Background(), MatchQuery{
+		Artist: "Anirudh Ravichander",
+		Title:  "Hukum",
+		Album:  "Jailer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1 == nil || t1.ID != 101 {
+		t.Fatalf("expected track 101 Hukum, got %+v", t1)
+	}
+	if searchCalls.Load() != 1 {
+		t.Fatalf("expected 1 search call on first track, got %d", searchCalls.Load())
+	}
+
+	// Subsequent tracks in the same album hit the album cache directly without HTTP calls!
+	t2, err := client.FindBestTrackMatch(context.Background(), MatchQuery{
+		Artist: "Anirudh Ravichander",
+		Title:  "Kaavaalaa",
+		Album:  "Jailer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t2 == nil || t2.ID != 102 {
+		t.Fatalf("expected track 102 Kaavaalaa from album cache, got %+v", t2)
+	}
+
+	t3, err := client.FindBestTrackMatch(context.Background(), MatchQuery{
+		Artist: "Anirudh Ravichander",
+		Title:  "Jailer Theme",
+		Album:  "Jailer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t3 == nil || t3.ID != 103 {
+		t.Fatalf("expected track 103 Jailer Theme from album cache, got %+v", t3)
+	}
+
+	// Verify only 1 HTTP request was made across all 3 tracks!
+	if searchCalls.Load() != 1 {
+		t.Errorf("expected still only 1 HTTP request across 3 tracks of the album, got %d", searchCalls.Load())
+	}
+}
+

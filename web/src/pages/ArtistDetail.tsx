@@ -14,7 +14,9 @@ import ConfirmModal from '../components/ConfirmModal';
 import {
   IconAlert,
   IconChevronRight,
+  IconClose,
   IconDisc,
+  IconGrip,
   IconLibrary,
   IconLink,
   IconRefresh,
@@ -37,6 +39,10 @@ export default function ArtistDetail() {
   const [relinkProvider, setRelinkProvider] = useState('');
   const [reconciling, setReconciling] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [draggingAlbumId, setDraggingAlbumId] = useState<number | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<number | null>(null);
+  const [pendingMerge, setPendingMerge] = useState<{ src: Album; dst: Album } | null>(null);
+  const [manualLinkSource, setManualLinkSource] = useState<Album | null>(null);
 
   const lastAlbumCount = useRef(-1);
   const reconcileTicks = useRef(0);
@@ -172,6 +178,40 @@ export default function ArtistDetail() {
     onError: (err: Error) => toast(err.message, 'error'),
   });
 
+  const autoMatch = useMutation({
+    mutationFn: () => api.matchUnmatchedAlbums(artistIdNum),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      if (data.matched > 0) {
+        toast(
+          `Auto-matched ${data.matched} album${data.matched > 1 ? 's' : ''}!`,
+          'success'
+        );
+      } else {
+        toast('No high-confidence matches found. Drag & drop or use manual link.', 'info');
+      }
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const linkAlbum = useMutation({
+    mutationFn: ({ srcId, targetAlbumId }: { srcId: number; targetAlbumId: number }) =>
+      api.linkAlbum(srcId, targetAlbumId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      toast('Album successfully linked and metadata mapped!', 'success');
+      setPendingMerge(null);
+      setManualLinkSource(null);
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
   useEffect(() => {
     if (!reconciling || !artist) return;
     if (activeArtistTask) return; // Wait while server task is explicitly running
@@ -215,6 +255,16 @@ export default function ArtistDetail() {
       downloadingTracks,
       recordTypes,
     };
+  }, [artist]);
+
+  const unmatchedAlbums = useMemo(() => {
+    if (!artist?.albums || artist.provider === 'local') return [];
+    return artist.albums.filter((a) => a.provider === 'local');
+  }, [artist]);
+
+  const providerAlbums = useMemo(() => {
+    if (!artist?.albums || artist.provider === 'local') return [];
+    return artist.albums.filter((a) => a.provider !== 'local');
   }, [artist]);
 
   const filteredAlbums = useMemo((): Album[] => {
@@ -589,6 +639,33 @@ export default function ArtistDetail() {
       {/* Albums */}
       {artist.albums && artist.albums.length > 0 && (
         <div className="space-y-3">
+          {unmatchedAlbums.length > 0 && providerAlbums.length > 0 && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 animate-fade-in">
+              <div className="flex items-start sm:items-center gap-3">
+                <div className="p-2 rounded-xl bg-amber-500/20 text-amber-300 shrink-0">
+                  <IconLink className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-amber-200">
+                    {unmatchedAlbums.length} Unmatched Local Album{unmatchedAlbums.length > 1 ? 's' : ''} Detected
+                  </p>
+                  <p className="text-xs text-amber-300/80 mt-0.5">
+                    Automatically match them to provider releases, or drag &amp; drop an unmatched album onto a wanted release below.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => autoMatch.mutate()}
+                disabled={autoMatch.isPending}
+                className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-zinc-950 transition-colors disabled:opacity-50 shrink-0"
+              >
+                <IconRefresh className={`w-3.5 h-3.5 ${autoMatch.isPending ? 'animate-spin' : ''}`} />
+                <span>{autoMatch.isPending ? 'Auto-Matching…' : 'Auto-Match All'}</span>
+              </button>
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
               Albums & Releases ({filteredAlbums.length})
@@ -631,60 +708,195 @@ export default function ArtistDetail() {
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            {filteredAlbums.map((album) => (
-              <Link
-                key={album.id}
-                to={`/album/${album.id}`}
-                className="group flex items-center gap-3 bg-zinc-900/65 hover:bg-zinc-900 border border-white/[0.06] hover:border-white/[0.14] rounded-xl p-2.5 transition-all"
-              >
-                <div className="w-12 h-12 rounded-lg bg-zinc-800 overflow-hidden shrink-0 border border-white/[0.06]">
-                  {album.cover_url ? (
-                    <img
-                      src={album.cover_url}
-                      alt=""
-                      className="w-full h-full object-cover"
-                      onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')}
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-zinc-600">
-                      <IconDisc className="w-5 h-5" />
+            {filteredAlbums.map((album) => {
+              const isUnmatched = album.provider === 'local' && artist.provider !== 'local';
+              const canDropHere = draggingAlbumId !== null && album.provider !== 'local' && draggingAlbumId !== album.id;
+              const isDropTarget = dropTargetId === album.id;
+              const isDraggingThis = draggingAlbumId === album.id;
+
+              return (
+                <div
+                  key={album.id}
+                  draggable={isUnmatched}
+                  onDragStart={(e) => {
+                    if (!isUnmatched) return;
+                    e.dataTransfer.setData('text/plain', String(album.id));
+                    e.dataTransfer.effectAllowed = 'move';
+                    setDraggingAlbumId(album.id);
+                  }}
+                  onDragEnd={() => {
+                    setDraggingAlbumId(null);
+                    setDropTargetId(null);
+                  }}
+                  onDragOver={(e) => {
+                    if (!canDropHere) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    if (dropTargetId !== album.id) {
+                      setDropTargetId(album.id);
+                    }
+                  }}
+                  onDragLeave={(e) => {
+                    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+                    if (dropTargetId === album.id) {
+                      setDropTargetId(null);
+                    }
+                  }}
+                  onDrop={(e) => {
+                    if (!canDropHere) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const srcId = Number(e.dataTransfer.getData('text/plain')) || draggingAlbumId;
+                    setDraggingAlbumId(null);
+                    setDropTargetId(null);
+                    if (srcId && srcId !== album.id) {
+                      const srcAlbum = artist.albums?.find((a) => a.id === srcId);
+                      if (srcAlbum) {
+                        setPendingMerge({ src: srcAlbum, dst: album });
+                      }
+                    }
+                  }}
+                  className={`group relative flex items-center gap-2.5 rounded-xl p-2.5 transition-all ${
+                    isDraggingThis
+                      ? 'opacity-40 border border-dashed border-amber-400 bg-amber-500/10'
+                      : isDropTarget
+                        ? 'border-2 border-amber-400 bg-amber-500/20 ring-4 ring-amber-400/30 scale-[1.01]'
+                        : canDropHere
+                          ? 'border border-dashed border-amber-500/40 bg-amber-500/5'
+                          : isUnmatched
+                            ? 'bg-zinc-900/80 hover:bg-zinc-900 border border-amber-500/25 hover:border-amber-500/45 cursor-grab active:cursor-grabbing'
+                            : 'bg-zinc-900/65 hover:bg-zinc-900 border border-white/[0.06] hover:border-white/[0.14]'
+                  }`}
+                >
+                  {isUnmatched && (
+                    <div
+                      className="text-amber-400/60 group-hover:text-amber-400 shrink-0 cursor-grab active:cursor-grabbing p-0.5"
+                      title="Drag onto a wanted release to link"
+                    >
+                      <IconGrip className="w-4 h-4" />
                     </div>
                   )}
-                </div>
 
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5">
-                    <p className="font-medium text-sm text-zinc-100 group-hover:text-amber-200 transition-colors truncate">
-                      {album.title}
-                    </p>
-                    {album.record_type && album.record_type !== 'album' && (
-                      <span className="text-[9px] font-medium uppercase text-zinc-400 bg-zinc-800 border border-white/[0.05] px-1.5 py-px rounded shrink-0">
-                        {album.record_type}
+                  <Link
+                    to={`/album/${album.id}`}
+                    className="flex items-center gap-3 flex-1 min-w-0"
+                    onClick={(e) => {
+                      if (draggingAlbumId !== null) e.preventDefault();
+                    }}
+                  >
+                    <div className="w-12 h-12 rounded-lg bg-zinc-800 overflow-hidden shrink-0 border border-white/[0.06]">
+                      {album.cover_url ? (
+                        <img
+                          src={album.cover_url}
+                          alt=""
+                          className="w-full h-full object-cover"
+                          onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')}
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-zinc-600">
+                          <IconDisc className="w-5 h-5" />
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <p className="font-medium text-sm text-zinc-100 group-hover:text-amber-200 transition-colors truncate">
+                          {album.title}
+                        </p>
+                        {album.record_type && album.record_type !== 'album' && (
+                          <span className="text-[9px] font-medium uppercase text-zinc-400 bg-zinc-800 border border-white/[0.05] px-1.5 py-px rounded shrink-0">
+                            {album.record_type}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-zinc-400 mt-0.5 truncate">
+                        {album.year ? `${album.year} · ` : ''}
+                        {album.tracks?.length || 0} tracks
+                        {trackFilter &&
+                          album.tracks &&
+                          (() => {
+                            const q = trackFilter.toLowerCase();
+                            const count = album.tracks.filter((t) =>
+                              t.title.toLowerCase().includes(q)
+                            ).length;
+                            return count > 0 ? ` · ${count} match${count > 1 ? 'es' : ''}` : '';
+                          })()}
+                      </p>
+                    </div>
+                  </Link>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {isDropTarget ? (
+                      <span className="text-xs font-semibold text-amber-300 bg-amber-400/20 px-2.5 py-1 rounded-lg animate-pulse">
+                        Drop to Link
                       </span>
+                    ) : (
+                      <>
+                        <AlbumStatusSummary album={album} artistProvider={artist.provider} />
+                        {isUnmatched && (
+                          <button
+                            type="button"
+                            title="Manually link to a release"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setManualLinkSource(album);
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-400/20 hover:bg-amber-400 text-amber-300 hover:text-zinc-950 border border-amber-400/30 transition-all shrink-0"
+                          >
+                            <IconLink className="w-3 h-3" />
+                            <span>Link</span>
+                          </button>
+                        )}
+                        <Link
+                          to={`/album/${album.id}`}
+                          className="text-zinc-600 group-hover:text-zinc-400 p-0.5"
+                        >
+                          <IconChevronRight className="w-4 h-4" />
+                        </Link>
+                      </>
                     )}
                   </div>
-                  <p className="text-xs text-zinc-400 mt-0.5 truncate">
-                    {album.year ? `${album.year} · ` : ''}
-                    {album.tracks?.length || 0} tracks
-                    {trackFilter &&
-                      album.tracks &&
-                      (() => {
-                        const q = trackFilter.toLowerCase();
-                        const count = album.tracks.filter((t) =>
-                          t.title.toLowerCase().includes(q)
-                        ).length;
-                        return count > 0 ? ` · ${count} match${count > 1 ? 'es' : ''}` : '';
-                      })()}
-                  </p>
                 </div>
-
-                <AlbumStatusSummary album={album} artistProvider={artist.provider} />
-                <IconChevronRight className="w-4 h-4 text-zinc-600 group-hover:text-zinc-400 shrink-0 transition-colors" />
-              </Link>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
+
+      {pendingMerge && (
+        <ConfirmModal
+          open={!!pendingMerge}
+          title="Link Local Album to Release?"
+          description={`Merge "${pendingMerge.src.title}" (${pendingMerge.src.tracks?.length || 0} tracks) into "${pendingMerge.dst.title}"? Local files will claim matching wanted tracks, and the duplicate local entry will be removed.`}
+          confirmLabel={linkAlbum.isPending ? 'Linking…' : 'Link & Merge'}
+          loading={linkAlbum.isPending}
+          onConfirm={() =>
+            linkAlbum.mutate({
+              srcId: pendingMerge.src.id,
+              targetAlbumId: pendingMerge.dst.id,
+            })
+          }
+          onCancel={() => setPendingMerge(null)}
+        />
+      )}
+
+      <ManualLinkModal
+        open={!!manualLinkSource}
+        sourceAlbum={manualLinkSource}
+        providerAlbums={providerAlbums}
+        loading={linkAlbum.isPending}
+        onSelect={(targetAlbumId) => {
+          if (manualLinkSource) {
+            linkAlbum.mutate({
+              srcId: manualLinkSource.id,
+              targetAlbumId,
+            });
+          }
+        }}
+        onClose={() => setManualLinkSource(null)}
+      />
 
       <ConfirmModal
         open={confirmDeleteOpen}
@@ -733,4 +945,123 @@ function AlbumStatusSummary({
     );
   }
   return <StatusBadge status="wanted" />;
+}
+
+function ManualLinkModal({
+  open,
+  sourceAlbum,
+  providerAlbums,
+  loading,
+  onSelect,
+  onClose,
+}: {
+  open: boolean;
+  sourceAlbum: Album | null;
+  providerAlbums: Album[];
+  loading: boolean;
+  onSelect: (targetAlbumId: number) => void;
+  onClose: () => void;
+}) {
+  const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    if (open) setSearch('');
+  }, [open]);
+
+  if (!open || !sourceAlbum) return null;
+
+  const filtered = providerAlbums.filter((a) => {
+    if (!search) return true;
+    return a.title.toLowerCase().includes(search.toLowerCase());
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-fade-in">
+      <div className="w-full max-w-lg bg-zinc-900 border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
+        <div className="flex items-center justify-between shrink-0">
+          <div>
+            <h3 className="text-base font-semibold text-zinc-100">Link Local Album</h3>
+            <p className="text-xs text-zinc-400 mt-0.5 truncate max-w-sm">
+              Link <span className="text-amber-300 font-medium">{sourceAlbum.title}</span> to a release
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="p-1 rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
+          >
+            <IconClose className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="shrink-0">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search provider releases..."
+            className="w-full bg-zinc-950 border border-white/[0.08] rounded-xl px-3.5 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-amber-500/50"
+            autoFocus
+          />
+        </div>
+
+        <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]">
+          {filtered.length === 0 ? (
+            <div className="text-center py-8 text-xs text-zinc-500">
+              No matching releases found
+            </div>
+          ) : (
+            filtered.map((a) => (
+              <div
+                key={a.id}
+                className="flex items-center gap-3 bg-zinc-950/70 hover:bg-zinc-800/80 border border-white/[0.05] rounded-xl p-2.5 transition-colors"
+              >
+                <div className="w-10 h-10 rounded-lg bg-zinc-800 overflow-hidden shrink-0 border border-white/[0.06]">
+                  {a.cover_url ? (
+                    <img src={a.cover_url} alt="" className="w-full h-full object-cover" />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-zinc-600">
+                      <IconDisc className="w-4 h-4" />
+                    </div>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-xs font-semibold text-zinc-200 truncate">{a.title}</p>
+                    {a.record_type && a.record_type !== 'album' && (
+                      <span className="text-[9px] font-medium uppercase text-zinc-400 bg-zinc-800 border border-white/[0.05] px-1 py-px rounded shrink-0">
+                        {a.record_type}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-zinc-400 mt-0.5">
+                    {a.year ? `${a.year} · ` : ''}
+                    {a.tracks?.length || 0} tracks
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => onSelect(a.id)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-400 hover:bg-amber-300 text-zinc-950 transition-colors shrink-0 disabled:opacity-50"
+                >
+                  {loading ? 'Linking…' : 'Link'}
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="flex justify-end pt-2 border-t border-white/[0.06] shrink-0">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 rounded-xl text-xs font-medium text-zinc-300 hover:bg-zinc-800 transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }

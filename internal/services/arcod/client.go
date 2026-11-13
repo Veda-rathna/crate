@@ -29,6 +29,7 @@ const (
 	DefaultBaseURL         = "https://arcod.xyz"
 	DefaultQuality         = 27 // 27 = Hi-Res / 24-bit FLAC; 6 = 16-bit FLAC
 	defaultSearchCacheTTL  = 2 * time.Minute
+	defaultAlbumCacheTTL   = 15 * time.Minute
 	defaultSearchRateLimit = 5 * time.Second // 12 searches/min steady state (under arcod's 14/min limit)
 	defaultRetryAfter      = 60 * time.Second
 )
@@ -119,6 +120,7 @@ type Client struct {
 	searchLimiter    *rate.Limiter
 	rateLimitedUntil time.Time
 	searchCache      map[string]cachedSearch
+	albumCache       map[string]cachedSearch
 }
 
 func NewClient(queries *db.Queries, downloadsDir string) *Client {
@@ -127,6 +129,7 @@ func NewClient(queries *db.Queries, downloadsDir string) *Client {
 		downloadsDir:  downloadsDir,
 		searchLimiter: rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
 		searchCache:   make(map[string]cachedSearch),
+		albumCache:    make(map[string]cachedSearch),
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -424,6 +427,32 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 		items:     append([]TrackItem(nil), items...),
 		expiresAt: time.Now().Add(defaultSearchCacheTTL),
 	}
+
+	// Index returned tracks into albumCache so other tracks in the same album
+	// can be retrieved instantly without burning search quota.
+	if c.albumCache == nil {
+		c.albumCache = make(map[string]cachedSearch)
+	}
+	albumGroups := make(map[string][]TrackItem)
+	for _, it := range items {
+		if strings.TrimSpace(it.Album) != "" {
+			k := normalizeAlbumKey(it.Artist, it.Album)
+			albumGroups[k] = append(albumGroups[k], it)
+			if strings.TrimSpace(it.AlbumArtist) != "" {
+				k2 := normalizeAlbumKey(it.AlbumArtist, it.Album)
+				if k2 != k {
+					albumGroups[k2] = append(albumGroups[k2], it)
+				}
+			}
+		}
+	}
+	now := time.Now()
+	for k, group := range albumGroups {
+		c.albumCache[k] = cachedSearch{
+			items:     group,
+			expiresAt: now.Add(defaultAlbumCacheTTL),
+		}
+	}
 	c.rateMu.Unlock()
 
 	return items, nil
@@ -472,6 +501,12 @@ func cleanString(s string) string {
 	return strings.ToLower(s)
 }
 
+func normalizeAlbumKey(artist, album string) string {
+	primary := matching.PrimaryArtist(artist)
+	cleanAlb := matching.StripQualifiers(album)
+	return strings.ToLower(strings.TrimSpace(primary + "|" + cleanAlb))
+}
+
 // FindBestTrack searches arcod for a track matching artist and title.
 // Returns the highest quality FLAC match, or nil if no good match is found.
 func (c *Client) FindBestTrack(ctx context.Context, artistName, trackTitle string) (*TrackItem, error) {
@@ -484,7 +519,41 @@ func (c *Client) FindBestTrack(ctx context.Context, artistName, trackTitle strin
 // FindBestTrackMatch searches arcod using relaxed metadata matching (preferring
 // studio versions, matching album/duration, and selecting the highest FLAC
 // bit-depth and sample-rate available).
+// It leverages an in-memory album cache and proactive album-level queries to satisfy
+// subsequent tracks in the same album with zero additional HTTP search calls.
 func (c *Client) FindBestTrackMatch(ctx context.Context, q MatchQuery) (*TrackItem, error) {
+	// 1. Check album cache first if album is known
+	if strings.TrimSpace(q.Album) != "" {
+		albumKey := normalizeAlbumKey(q.Artist, q.Album)
+		c.rateMu.Lock()
+		entry, ok := c.albumCache[albumKey]
+		if ok && time.Now().Before(entry.expiresAt) {
+			cachedItems := append([]TrackItem(nil), entry.items...)
+			c.rateMu.Unlock()
+			if best := pickBestMatch(cachedItems, q); best != nil {
+				slog.Debug("arcod: album cache hit for track", "artist", q.Artist, "album", q.Album, "title", q.Title)
+				return best, nil
+			}
+		} else {
+			c.rateMu.Unlock()
+		}
+
+		// 2. If not yet in album cache, search once by album to pre-fill the cache for all tracks!
+		primaryArtist := matching.PrimaryArtist(q.Artist)
+		cleanAlb := matching.StripQualifiers(q.Album)
+		albumQuery := matching.CleanSearchQuery(primaryArtist, cleanAlb)
+		if albumQuery != "" {
+			albumResults, err := c.Search(ctx, albumQuery)
+			if err != nil {
+				return nil, err
+			}
+			if best := pickBestMatch(albumResults, q); best != nil {
+				return best, nil
+			}
+		}
+	}
+
+	// 3. Fall back to track-specific queries
 	queries := buildSearchQueries(q)
 	for _, query := range queries {
 		results, err := c.Search(ctx, query)
