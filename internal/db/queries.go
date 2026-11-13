@@ -45,9 +45,9 @@ func (q *Queries) CreateArtist(a *models.Artist) error {
 		}
 	}
 	result, err := q.db.Exec(
-		`INSERT INTO artists (name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.Name, a.Provider, a.ProviderID, a.ImageURL, a.Status, a.WatchNewReleases, a.WatchNewReleasesSince, langsJSON, ts, ts,
+		`INSERT INTO artists (name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.Name, a.Provider, a.ProviderID, a.ImageURL, a.Status, a.WatchNewReleases, a.WatchNewReleasesSince, langsJSON, a.SyncPaused, ts, ts,
 	)
 	if err != nil {
 		return err
@@ -62,9 +62,9 @@ func (q *Queries) GetArtist(id int64) (*models.Artist, error) {
 	a := &models.Artist{}
 	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at
 		 FROM artists WHERE id = ?`, id,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +74,7 @@ func (q *Queries) GetArtist(id int64) (*models.Artist, error) {
 
 func (q *Queries) ListArtists() ([]models.Artist, error) {
 	rows, err := q.db.Query(
-		`SELECT a.id, a.name, a.provider, a.provider_id, a.image_url, a.status, a.watch_new_releases, a.watch_new_releases_since, a.languages, a.created_at, a.updated_at,
+		`SELECT a.id, a.name, a.provider, a.provider_id, a.image_url, a.status, a.watch_new_releases, a.watch_new_releases_since, a.languages, a.sync_paused, a.created_at, a.updated_at,
 		        COUNT(t.id) as total_tracks,
 		        COALESCE(SUM(CASE WHEN t.status = 'owned' THEN 1 ELSE 0 END), 0) as owned_tracks
 		 FROM artists a
@@ -93,13 +93,18 @@ func (q *Queries) ListArtists() ([]models.Artist, error) {
 		var a models.Artist
 		var langsRaw *string
 		if err := rows.Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status,
-			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt, &a.TotalTracks, &a.OwnedTracks); err != nil {
+			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt, &a.TotalTracks, &a.OwnedTracks); err != nil {
 			return nil, err
 		}
 		a.Languages = parseLanguages(langsRaw)
 		artists = append(artists, a)
 	}
 	return artists, rows.Err()
+}
+
+func (q *Queries) SetArtistSyncPaused(id int64, paused bool) error {
+	_, err := q.db.Exec(`UPDATE artists SET sync_paused = ?, updated_at = ? WHERE id = ?`, paused, now(), id)
+	return err
 }
 
 func (q *Queries) UpdateArtistStatus(id int64, status models.ArtistStatus) error {
@@ -148,9 +153,9 @@ func (q *Queries) FindArtistByProvider(provider, providerID string) (*models.Art
 	a := &models.Artist{}
 	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at
 		 FROM artists WHERE provider = ? AND provider_id = ?`, provider, providerID,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -165,9 +170,9 @@ func (q *Queries) FindArtistByNameFold(name string) (*models.Artist, error) {
 	a := &models.Artist{}
 	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at
 		 FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1`, name,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +182,7 @@ func (q *Queries) FindArtistByNameFold(name string) (*models.Artist, error) {
 
 func (q *Queries) ListWatchedArtists() ([]models.Artist, error) {
 	rows, err := q.db.Query(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at
 		 FROM artists WHERE watch_new_releases = 1 ORDER BY name`,
 	)
 	if err != nil {
@@ -190,7 +195,7 @@ func (q *Queries) ListWatchedArtists() ([]models.Artist, error) {
 		var a models.Artist
 		var langsRaw *string
 		if err := rows.Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status,
-			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			&a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.Languages = parseLanguages(langsRaw)
@@ -729,9 +734,9 @@ func (q *Queries) NextArtistForUpgrade(lastID int64) (*models.Artist, error) {
 	a := &models.Artist{}
 	var langsRaw *string
 	err := q.db.QueryRow(
-		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, created_at, updated_at
+		`SELECT id, name, provider, provider_id, image_url, status, watch_new_releases, watch_new_releases_since, languages, sync_paused, created_at, updated_at
 		 FROM artists WHERE id > ? ORDER BY id LIMIT 1`, lastID,
-	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Name, &a.Provider, &a.ProviderID, &a.ImageURL, &a.Status, &a.WatchNewReleases, &a.WatchNewReleasesSince, &langsRaw, &a.SyncPaused, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -745,7 +750,7 @@ func (q *Queries) EnqueueDownload(trackID int64) error {
 	_, err := q.db.Exec(
 		`INSERT INTO download_queue (track_id, status, source, created_at)
 		 VALUES (?, 'pending', 'user', ?)
-		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing') DO NOTHING`,
+		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing', 'paused') DO NOTHING`,
 		trackID, now(),
 	)
 	return err
@@ -759,7 +764,7 @@ func (q *Queries) ReenqueueDownload(trackID int64) error {
 	_, err := q.db.Exec(
 		`INSERT INTO download_queue (track_id, status, source, created_at)
 		 VALUES (?, 'pending', 'scheduler', ?)
-		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing') DO NOTHING`,
+		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing', 'paused') DO NOTHING`,
 		trackID, now(),
 	)
 	return err
@@ -769,7 +774,7 @@ func (q *Queries) EnqueueDownloadReturningID(trackID int64) (int64, error) {
 	result, err := q.db.Exec(
 		`INSERT INTO download_queue (track_id, status, source, created_at)
 		 VALUES (?, 'pending', 'user', ?)
-		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing') DO NOTHING`,
+		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing', 'paused') DO NOTHING`,
 		trackID, now(),
 	)
 	if err != nil {
@@ -777,6 +782,42 @@ func (q *Queries) EnqueueDownloadReturningID(trackID int64) (int64, error) {
 	}
 	id, _ := result.LastInsertId()
 	return id, nil
+}
+
+func (q *Queries) PauseDownload(id int64) error {
+	_, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'paused', next_retry_at = NULL WHERE id = ? AND status IN ('pending', 'searching', 'downloading')`,
+		id,
+	)
+	return err
+}
+
+func (q *Queries) ResumeDownload(id int64) error {
+	_, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'pending', next_retry_at = NULL, error = NULL WHERE id = ? AND status = 'paused'`,
+		id,
+	)
+	return err
+}
+
+func (q *Queries) PauseAllDownloads() (int64, error) {
+	result, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'paused', next_retry_at = NULL WHERE status IN ('pending', 'searching', 'downloading')`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (q *Queries) ResumeAllDownloads() (int64, error) {
+	result, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'pending', next_retry_at = NULL, error = NULL WHERE status = 'paused'`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (q *Queries) ListDownloads(status string) ([]models.DownloadQueueItem, error) {
@@ -855,7 +896,7 @@ func (q *Queries) EnqueueDownloadBatch(trackIDs []int64) (int, error) {
 	stmt, err := tx.Prepare(
 		`INSERT INTO download_queue (track_id, status, source, created_at)
 		 VALUES (?, 'pending', 'user', ?)
-		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing') DO NOTHING`,
+		 ON CONFLICT (track_id) WHERE status IN ('pending', 'searching', 'downloading', 'organizing', 'paused') DO NOTHING`,
 	)
 	if err != nil {
 		return 0, err

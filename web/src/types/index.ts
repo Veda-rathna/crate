@@ -8,6 +8,7 @@ export interface Artist {
   watch_new_releases: boolean;
   watch_new_releases_since?: string;
   languages?: string[];
+  sync_paused?: boolean;
   created_at: string;
   updated_at: string;
   albums?: Album[];
@@ -56,7 +57,7 @@ export interface DownloadQueueItem {
   id: number;
   track_id: number;
   slskd_search_id?: string;
-  status: 'pending' | 'searching' | 'downloading' | 'organizing' | 'complete' | 'failed';
+  status: 'pending' | 'searching' | 'downloading' | 'organizing' | 'complete' | 'failed' | 'paused';
   attempts: number;
   last_attempt?: string;
   error?: string;
@@ -156,6 +157,9 @@ export interface SystemStatus {
   organizing_downloads?: number;
   failed_downloads?: number;
   complete_downloads?: number;
+  paused_downloads?: number;
+  downloads_paused?: boolean;
+  sync_paused?: boolean;
   unlinked_artists?: number;
   orphaned_artists?: number;
   unhealthy_providers?: number;

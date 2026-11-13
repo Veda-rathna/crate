@@ -34,6 +34,7 @@ const (
 	DownloadStatusOrganizing  DownloadStatus = "organizing"
 	DownloadStatusComplete    DownloadStatus = "complete"
 	DownloadStatusFailed      DownloadStatus = "failed"
+	DownloadStatusPaused      DownloadStatus = "paused"
 )
 
 type Artist struct {
@@ -46,6 +47,7 @@ type Artist struct {
 	WatchNewReleases      bool         `json:"watch_new_releases" db:"watch_new_releases"`
 	WatchNewReleasesSince *string      `json:"watch_new_releases_since,omitempty" db:"watch_new_releases_since"`
 	Languages             []string     `json:"languages" db:"languages"`
+	SyncPaused            bool         `json:"sync_paused" db:"sync_paused"`
 	CreatedAt             string       `json:"created_at" db:"created_at"`
 	UpdatedAt             string       `json:"updated_at" db:"updated_at"`
 	Albums                []Album      `json:"albums,omitempty"`

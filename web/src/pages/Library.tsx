@@ -14,6 +14,8 @@ import {
   IconGrid,
   IconLibrary,
   IconList,
+  IconPause,
+  IconPlay,
   IconRefresh,
   IconSearch,
 } from '../components/Icons';
@@ -56,6 +58,31 @@ export default function Library() {
           : 'No watched artists need syncing right now',
         res.started > 0 ? 'success' : 'info'
       );
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const pauseAllSync = useMutation({
+    mutationFn: api.pauseAllSync,
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      toast(
+        res.cancelled > 0
+          ? `Paused discography sync globally (stopped ${res.cancelled} active sync${res.cancelled === 1 ? '' : 's'})`
+          : 'Paused discography sync globally',
+        'info'
+      );
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeAllSync = useMutation({
+    mutationFn: api.resumeAllSync,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      toast('Resumed discography sync globally', 'success');
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
@@ -224,10 +251,34 @@ export default function Library() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {status?.sync_paused ? (
+            <button
+              type="button"
+              onClick={() => resumeAllSync.mutate()}
+              disabled={resumeAllSync.isPending}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-50 shadow-sm"
+              title="Resume automatic and manual discography syncing for all artists"
+            >
+              <IconPlay className="w-3.5 h-3.5 fill-current" />
+              <span>{resumeAllSync.isPending ? 'Resuming…' : 'Resume Sync All'}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => pauseAllSync.mutate()}
+              disabled={pauseAllSync.isPending}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 rounded-xl text-xs font-medium transition-colors disabled:opacity-50"
+              title="Pause automatic discography syncing for all artists"
+            >
+              <IconPause className="w-3.5 h-3.5" />
+              <span>{pauseAllSync.isPending ? 'Pausing…' : 'Pause Sync All'}</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => syncAll.mutate()}
-            disabled={syncAll.isPending}
+            disabled={syncAll.isPending || status?.sync_paused}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 rounded-xl text-xs font-medium transition-colors disabled:opacity-50"
           >
             <IconRefresh className={`w-3.5 h-3.5 ${syncAll.isPending ? 'animate-spin' : ''}`} />
@@ -242,6 +293,26 @@ export default function Library() {
           </Link>
         </div>
       </div>
+
+      {/* Global Discography Sync Paused Banner */}
+      {status?.sync_paused && (
+        <div className="flex items-center justify-between gap-3 p-3.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-200 animate-fade-in">
+          <div className="flex items-center gap-2.5">
+            <IconPause className="w-4 h-4 text-amber-400 shrink-0" />
+            <p className="text-xs font-medium">
+              Discography syncing is paused globally — automated checks for new releases and metadata syncs are on hold.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => resumeAllSync.mutate()}
+            disabled={resumeAllSync.isPending}
+            className="px-3 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 text-xs font-semibold shrink-0 transition-colors"
+          >
+            Resume Sync All
+          </button>
+        </div>
+      )}
 
       {/* Live Background Work Banner */}
       {(hasRunningWork || activeTasks.length > 0 || importStatus?.status === 'running') && (
@@ -560,6 +631,7 @@ function ArtistCard({
             {artist.provider === 'local' && <StatusBadge status="not linked" />}
             {artist.orphaned && <StatusBadge status="orphaned" />}
             {artist.status === 'owned' && <StatusBadge status="owned" />}
+            {artist.sync_paused && <StatusBadge status="sync paused" />}
             {artist.languages && artist.languages.length > 0 && !artist.languages.includes('all') && (
               <span className="text-[10px] text-zinc-400 bg-zinc-800/90 border border-white/[0.06] px-1.5 py-0.5 rounded uppercase">
                 {artist.languages.join(', ')}
@@ -622,6 +694,7 @@ function ArtistRow({
       {artist.provider === 'local' && <StatusBadge status="not linked" />}
       {artist.orphaned && <StatusBadge status="orphaned" />}
       {artist.status === 'owned' && <StatusBadge status="owned" />}
+      {artist.sync_paused && <StatusBadge status="sync paused" />}
       <IconChevronRight className="w-4 h-4 text-zinc-600 shrink-0" />
     </Link>
   );

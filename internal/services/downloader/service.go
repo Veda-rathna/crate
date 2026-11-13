@@ -245,6 +245,25 @@ func (s *Service) GetProgress(ctx context.Context) ([]ProgressItem, error) {
 	return items, nil
 }
 
+func (s *Service) IsQueuePaused() bool {
+	if s.queries == nil {
+		return false
+	}
+	v, err := s.queries.GetSetting("downloads_paused")
+	return err == nil && v == "true"
+}
+
+func (s *Service) CancelAllActive(ctx context.Context) {
+	downloading, _ := s.queries.ListDownloads("downloading")
+	for _, d := range downloading {
+		s.CancelTransfer(ctx, &d)
+	}
+	searching, _ := s.queries.ListDownloads("searching")
+	for _, d := range searching {
+		s.CancelTransfer(ctx, &d)
+	}
+}
+
 // Run processes the download queue on a ticker. Call in a goroutine.
 func (s *Service) Run(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -260,6 +279,10 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) {
 }
 
 func (s *Service) tick(ctx context.Context) {
+	if s.IsQueuePaused() {
+		return
+	}
+
 	retryable, err := s.queries.ListRetryableDownloads()
 	if err == nil {
 		for _, d := range retryable {

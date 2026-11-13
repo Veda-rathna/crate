@@ -30,6 +30,14 @@ const STATUS_STYLES: Record<string, { classes: string; label?: string; dot?: str
   ignored: {
     classes: 'bg-zinc-800/80 text-zinc-400 border-zinc-700/60',
   },
+  paused: {
+    classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    label: 'Paused',
+  },
+  'sync paused': {
+    classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    label: 'Sync Paused',
+  },
   local: {
     classes: 'bg-amber-500/15 text-amber-300 border-amber-500/25',
   },

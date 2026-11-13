@@ -44,8 +44,20 @@ export const api = {
   getArtist: (id: number) => request<Artist>(`/artists/${id}`),
   syncArtist: (id: number) =>
     request<{ status: string }>(`/artists/${id}/sync`, { method: 'POST' }),
+  pauseArtistSync: (id: number) =>
+    request<{ status: string; artist_id: number; sync_paused: boolean }>(`/artists/${id}/pause-sync`, {
+      method: 'POST',
+    }),
+  resumeArtistSync: (id: number) =>
+    request<{ status: string; artist_id: number; sync_paused: boolean }>(`/artists/${id}/resume-sync`, {
+      method: 'POST',
+    }),
   syncAllArtists: () =>
     request<{ status: string; started: number }>('/artists/sync', { method: 'POST' }),
+  pauseAllSync: () =>
+    request<{ status: string; cancelled: number }>('/artists/pause-sync', { method: 'POST' }),
+  resumeAllSync: () =>
+    request<{ status: string }>('/artists/resume-sync', { method: 'POST' }),
   getAlbum: (id: number) => request<Album>(`/albums/${id}`),
 
   queueTrack: (id: number) =>
@@ -106,6 +118,14 @@ export const api = {
     request<DownloadProgress[]>('/downloads/progress'),
   queueDownloads: () =>
     request<{ queued: number }>('/downloads/queue', { method: 'POST' }),
+  pauseAllDownloads: () =>
+    request<{ status: string; affected: number }>('/downloads/pause', { method: 'POST' }),
+  resumeAllDownloads: () =>
+    request<{ status: string; affected: number }>('/downloads/resume', { method: 'POST' }),
+  pauseDownload: (id: number) =>
+    request<{ status: string; id: number }>(`/downloads/${id}/pause`, { method: 'POST' }),
+  resumeDownload: (id: number) =>
+    request<{ status: string; id: number }>(`/downloads/${id}/resume`, { method: 'POST' }),
   retryDownload: (id: number) =>
     request<void>(`/downloads/${id}/retry`, { method: 'POST' }),
   deleteDownload: (id: number) =>

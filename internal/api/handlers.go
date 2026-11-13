@@ -108,6 +108,41 @@ func (s *Server) finishTask(id string) {
 	s.tasksMu.Lock()
 	defer s.tasksMu.Unlock()
 	delete(s.tasks, id)
+	delete(s.taskCancels, id)
+}
+
+func (s *Server) cancelTask(id string) bool {
+	s.tasksMu.Lock()
+	cancel, ok := s.taskCancels[id]
+	if ok {
+		delete(s.tasks, id)
+		delete(s.taskCancels, id)
+	}
+	s.tasksMu.Unlock()
+	if ok && cancel != nil {
+		cancel()
+		return true
+	}
+	return false
+}
+
+func (s *Server) cancelAllSyncTasks() int {
+	s.tasksMu.Lock()
+	cancels := make([]context.CancelFunc, 0)
+	for id, t := range s.tasks {
+		if t.Kind == "sync_artist" || strings.HasPrefix(id, "sync-artist-") {
+			if c, ok := s.taskCancels[id]; ok && c != nil {
+				cancels = append(cancels, c)
+			}
+			delete(s.tasks, id)
+			delete(s.taskCancels, id)
+		}
+	}
+	s.tasksMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	return len(cancels)
 }
 
 func (s *Server) listTasks() []BackgroundTask {
@@ -137,6 +172,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	organizing := 0
 	failed := 0
 	complete := 0
+	paused := 0
 	for _, d := range downloads {
 		switch d.Status {
 		case models.DownloadStatusPending:
@@ -151,9 +187,24 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			failed++
 		case models.DownloadStatusComplete:
 			complete++
+		case models.DownloadStatusPaused:
+			paused++
 		}
 	}
 	active := searching + downloading
+
+	downloadsPaused := false
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("downloads_paused"); err == nil && v == "true" {
+			downloadsPaused = true
+		}
+	}
+	syncPaused := false
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("sync_discography_paused"); err == nil && v == "true" {
+			syncPaused = true
+		}
+	}
 
 	totalTracks := 0
 	ownedTracks := 0
@@ -195,6 +246,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"organizing_downloads":  organizing,
 		"failed_downloads":      failed,
 		"complete_downloads":    complete,
+		"paused_downloads":      paused,
+		"downloads_paused":      downloadsPaused,
+		"sync_paused":           syncPaused,
 		"unlinked_artists":      unlinkedArtists,
 		"orphaned_artists":      orphanedArtists,
 		"unhealthy_providers":   unhealthyProviders,
@@ -520,6 +574,17 @@ func (s *Server) handleSyncArtist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if artist.SyncPaused {
+		writeError(w, http.StatusConflict, "artist discography sync is paused; resume sync first")
+		return
+	}
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("sync_discography_paused"); err == nil && v == "true" {
+			writeError(w, http.StatusConflict, "discography sync is paused globally; resume all sync first")
+			return
+		}
+	}
+
 	if !s.syncArtistAsync(artist, true) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "already_syncing"})
 		return
@@ -528,7 +593,107 @@ func (s *Server) handleSyncArtist(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "syncing"})
 }
 
+func (s *Server) handlePauseArtistSync(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	artist, err := s.queries.GetArtist(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "artist not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get artist")
+		return
+	}
+
+	if err := s.queries.SetArtistSyncPaused(id, true); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to pause artist sync")
+		return
+	}
+
+	taskID := fmt.Sprintf("sync-artist-%d", id)
+	s.cancelTask(taskID)
+
+	s.recordActivity("artist_sync_paused", "artist", id, fmt.Sprintf("Paused discography sync for %s", artist.Name))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "sync_paused",
+		"artist_id":   id,
+		"sync_paused": true,
+	})
+}
+
+func (s *Server) handleResumeArtistSync(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	artist, err := s.queries.GetArtist(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "artist not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get artist")
+		return
+	}
+
+	if err := s.queries.SetArtistSyncPaused(id, false); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resume artist sync")
+		return
+	}
+
+	s.recordActivity("artist_sync_resumed", "artist", id, fmt.Sprintf("Resumed discography sync for %s", artist.Name))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "sync_resumed",
+		"artist_id":   id,
+		"sync_paused": false,
+	})
+}
+
+func (s *Server) handlePauseAllSync(w http.ResponseWriter, r *http.Request) {
+	if err := s.queries.SetSetting("sync_discography_paused", "true"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to pause discography sync")
+		return
+	}
+
+	cancelled := s.cancelAllSyncTasks()
+	s.recordActivity("all_sync_paused", "library", 0, "Paused discography sync globally")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "all_sync_paused",
+		"cancelled": cancelled,
+	})
+}
+
+func (s *Server) handleResumeAllSync(w http.ResponseWriter, r *http.Request) {
+	if err := s.queries.SetSetting("sync_discography_paused", "false"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resume discography sync")
+		return
+	}
+
+	s.recordActivity("all_sync_resumed", "library", 0, "Resumed discography sync globally")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "all_sync_resumed",
+	})
+}
+
 func (s *Server) handleSyncAllArtists(w http.ResponseWriter, r *http.Request) {
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("sync_discography_paused"); err == nil && v == "true" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":  "all_sync_paused",
+				"started": 0,
+				"message": "Discography sync is paused globally. Resume sync first.",
+			})
+			return
+		}
+	}
+
 	artists, err := s.queries.ListArtists()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list artists")
@@ -538,6 +703,9 @@ func (s *Server) handleSyncAllArtists(w http.ResponseWriter, r *http.Request) {
 	started := 0
 	for i := range artists {
 		a := &artists[i]
+		if a.SyncPaused {
+			continue
+		}
 		if a.Provider == provider.LocalProvider || !s.providers.HasProvider(a.Provider) {
 			continue
 		}
@@ -557,24 +725,42 @@ func (s *Server) handleSyncAllArtists(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) syncArtistAsync(artist *models.Artist, skipCache bool) bool {
 	taskID := fmt.Sprintf("sync-artist-%d", artist.ID)
-	if !s.tryStartTask(
-		taskID,
-		"sync_artist",
-		fmt.Sprintf("Syncing metadata: %s", artist.Name),
-		fmt.Sprintf("Fetching latest releases from %s...", artist.Provider),
-		0,
-		artist.ID,
-	) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.tasksMu.Lock()
+	if s.tasks == nil {
+		s.tasks = make(map[string]*BackgroundTask)
+	}
+	if s.taskCancels == nil {
+		s.taskCancels = make(map[string]context.CancelFunc)
+	}
+	if _, exists := s.tasks[taskID]; exists {
+		s.tasksMu.Unlock()
+		cancel()
 		return false
 	}
+	s.tasks[taskID] = &BackgroundTask{
+		ID:        taskID,
+		Kind:      "sync_artist",
+		Title:     fmt.Sprintf("Syncing metadata: %s", artist.Name),
+		Detail:    fmt.Sprintf("Fetching latest releases from %s...", artist.Provider),
+		Total:     0,
+		EntityID:  artist.ID,
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	s.taskCancels[taskID] = cancel
+	s.tasksMu.Unlock()
 
 	artistCopy := *artist
 	s.bgWork.Add(1)
 	go func() {
 		defer s.bgWork.Done()
+		defer cancel()
 		defer s.finishTask(taskID)
 
-		ctx := context.Background()
+		if ctx.Err() != nil {
+			return
+		}
+
 		var artistDetail *pb.ArtistDetail
 		var albumList *pb.AlbumList
 		var err error
@@ -593,6 +779,9 @@ func (s *Server) syncArtistAsync(artist *models.Artist, skipCache bool) bool {
 		}
 		if err != nil {
 			slog.Error("sync artist: fetch discography", "artist_id", artistCopy.ID, "provider", artistCopy.Provider, "error", err)
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 
@@ -659,6 +848,10 @@ func (s *Server) saveAlbumsWithOptions(providerName string, artistID int64, albu
 
 func (s *Server) processArtistAlbums(ctx context.Context, providerName string, artistID int64, artistName string, albums []*pb.AlbumSummary, skipCache bool, taskID string) {
 	for i, pa := range albums {
+		if ctx.Err() != nil {
+			slog.Info("sync artist: cancelled", "artist_id", artistID)
+			return
+		}
 		s.updateTask(taskID, i+1, fmt.Sprintf("Fetching release %d of %d: %s", i+1, len(albums), pa.Title))
 		if existingAlbum, _ := s.queries.FindAlbumByProvider(providerName, pa.Id); existingAlbum != nil {
 			_ = s.queries.UpdateAlbumMeta(existingAlbum.ID, pa.Title, intPtrOrNil(int(pa.Year)), strPtrOrNil(pa.CoverUrl), pa.RecordType)
@@ -1400,12 +1593,12 @@ func (s *Server) handleClearDownloadsByStatus(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "status parameter required")
 		return
 	}
-	allowed := map[string]bool{"failed": true, "complete": true, "pending": true, "downloading": true, "searching": true}
+	allowed := map[string]bool{"failed": true, "complete": true, "pending": true, "downloading": true, "searching": true, "paused": true}
 	if !allowed[status] {
-		writeError(w, http.StatusBadRequest, "can only clear failed, complete, pending, downloading, or searching downloads")
+		writeError(w, http.StatusBadRequest, "can only clear failed, complete, pending, downloading, searching, or paused downloads")
 		return
 	}
-	resetTrack := status == "downloading" || status == "searching" || status == "pending"
+	resetTrack := status == "downloading" || status == "searching" || status == "pending" || status == "paused"
 	if resetTrack {
 		s.queries.ResetTrackStatusForDownloads(status)
 	}
@@ -1415,6 +1608,107 @@ func (s *Server) handleClearDownloadsByStatus(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"deleted": deleted})
+}
+
+func (s *Server) handlePauseDownload(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	d, err := s.queries.GetDownload(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "download not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get download")
+		return
+	}
+
+	if d.Status == models.DownloadStatusDownloading || d.Status == models.DownloadStatusSearching {
+		s.downloader.CancelTransfer(r.Context(), d)
+	}
+
+	if err := s.queries.PauseDownload(id); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to pause download")
+		return
+	}
+
+	s.recordActivity("download_paused", "track", d.TrackID, fmt.Sprintf("Paused download #%d", id))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "paused",
+		"id":     id,
+	})
+}
+
+func (s *Server) handleResumeDownload(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+
+	d, err := s.queries.GetDownload(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "download not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get download")
+		return
+	}
+
+	if err := s.queries.ResumeDownload(id); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resume download")
+		return
+	}
+
+	s.recordActivity("download_resumed", "track", d.TrackID, fmt.Sprintf("Resumed download #%d", id))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "pending",
+		"id":     id,
+	})
+}
+
+func (s *Server) handlePauseAllDownloads(w http.ResponseWriter, r *http.Request) {
+	if err := s.queries.SetSetting("downloads_paused", "true"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to set pause state")
+		return
+	}
+
+	s.downloader.CancelAllActive(r.Context())
+	affected, err := s.queries.PauseAllDownloads()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to pause downloads")
+		return
+	}
+
+	s.recordActivity("all_downloads_paused", "queue", 0, fmt.Sprintf("Paused all downloads (%d items paused)", affected))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "paused",
+		"affected": affected,
+	})
+}
+
+func (s *Server) handleResumeAllDownloads(w http.ResponseWriter, r *http.Request) {
+	if err := s.queries.SetSetting("downloads_paused", "false"); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to set resume state")
+		return
+	}
+
+	affected, err := s.queries.ResumeAllDownloads()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to resume downloads")
+		return
+	}
+
+	s.recordActivity("all_downloads_resumed", "queue", 0, fmt.Sprintf("Resumed all downloads (%d items resumed)", affected))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "resumed",
+		"affected": affected,
+	})
 }
 
 func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {

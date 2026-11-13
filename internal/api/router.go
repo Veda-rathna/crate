@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,7 @@ type Server struct {
 	bgWork       sync.WaitGroup
 	tasksMu      sync.Mutex
 	tasks        map[string]*BackgroundTask
+	taskCancels  map[string]context.CancelFunc
 	startTime    time.Time
 	libraryDir   string
 	version      string
@@ -62,6 +64,7 @@ func NewServer(queries *db.Queries, providers *provider.Manager, c *cache.Cache,
 		langResolver: language.NewResolver(cacheStore, settingsReader),
 		frontendFS:   frontendFS,
 		tasks:        make(map[string]*BackgroundTask),
+		taskCancels:  make(map[string]context.CancelFunc),
 		startTime:    time.Now().UTC(),
 		libraryDir:   libraryDir,
 		version:      version,
@@ -120,8 +123,12 @@ func (s *Server) setupRouter() chi.Router {
 		r.Route("/artists", func(r chi.Router) {
 			r.Get("/", s.handleListArtists)
 			r.Post("/sync", s.handleSyncAllArtists)
+			r.Post("/pause-sync", s.handlePauseAllSync)
+			r.Post("/resume-sync", s.handleResumeAllSync)
 			r.Get("/{id}", s.handleGetArtist)
 			r.Post("/{id}/sync", s.handleSyncArtist)
+			r.Post("/{id}/pause-sync", s.handlePauseArtistSync)
+			r.Post("/{id}/resume-sync", s.handleResumeArtistSync)
 			r.Put("/{id}/new-releases", s.handleToggleNewReleases)
 			r.Put("/{id}/languages", s.handleUpdateArtistLanguages)
 			r.Post("/{id}/queue", s.handleQueueArtistTracks)
@@ -156,7 +163,11 @@ func (s *Server) setupRouter() chi.Router {
 			r.Get("/", s.handleListDownloads)
 			r.Get("/progress", s.handleDownloadProgress)
 			r.Post("/queue", s.handleQueueDownloads)
+			r.Post("/pause", s.handlePauseAllDownloads)
+			r.Post("/resume", s.handleResumeAllDownloads)
 			r.Delete("/clear", s.handleClearDownloadsByStatus)
+			r.Post("/{id}/pause", s.handlePauseDownload)
+			r.Post("/{id}/resume", s.handleResumeDownload)
 			r.Post("/{id}/retry", s.handleRetryDownload)
 			r.Delete("/{id}", s.handleDeleteDownload)
 		})

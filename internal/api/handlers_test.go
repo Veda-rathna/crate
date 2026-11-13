@@ -3207,3 +3207,148 @@ func TestArcodAccountsAPI(t *testing.T) {
 		}
 	}
 }
+
+func TestPauseAndResumeDownloadsAPI(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Seed artist, album, track
+	artist := &models.Artist{Name: "Radiohead", Provider: "test", ProviderID: "a1", Status: models.ArtistStatusWatched}
+	if err := env.queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	album := &models.Album{ArtistID: artist.ID, Title: "OK Computer", Provider: "test", ProviderID: "al1", RecordType: "album", Status: models.AlbumStatusWatched}
+	if err := env.queries.CreateAlbum(album); err != nil {
+		t.Fatal(err)
+	}
+	track := &models.Track{AlbumID: album.ID, Title: "Airbag", TrackNumber: 1, DiscNumber: 1, DurationMs: 284000, Provider: "test", ProviderID: "t1", Status: models.TrackStatusWanted}
+	if err := env.queries.CreateTrack(track); err != nil {
+		t.Fatal(err)
+	}
+
+	dlID, err := env.queries.EnqueueDownloadReturningID(track.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Pause individual download
+	w := env.do("POST", fmt.Sprintf("/api/downloads/%d/pause", dlID), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause download status = %d: %s", w.Code, w.Body.String())
+	}
+	dl, _ := env.queries.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPaused {
+		t.Errorf("expected download status 'paused', got %q", dl.Status)
+	}
+
+	// Verify status endpoint reflects paused count
+	w = env.do("GET", "/api/status", "")
+	var stat map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &stat)
+	if stat["paused_downloads"] != float64(1) {
+		t.Errorf("expected 1 paused download, got %v", stat["paused_downloads"])
+	}
+
+	// 2. Resume individual download
+	w = env.do("POST", fmt.Sprintf("/api/downloads/%d/resume", dlID), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume download status = %d: %s", w.Code, w.Body.String())
+	}
+	dl, _ = env.queries.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPending {
+		t.Errorf("expected download status 'pending', got %q", dl.Status)
+	}
+
+	// 3. Pause all downloads
+	w = env.do("POST", "/api/downloads/pause", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause all downloads status = %d: %s", w.Code, w.Body.String())
+	}
+	dl, _ = env.queries.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPaused {
+		t.Errorf("expected paused after pause all, got %q", dl.Status)
+	}
+	w = env.do("GET", "/api/status", "")
+	_ = json.Unmarshal(w.Body.Bytes(), &stat)
+	if stat["downloads_paused"] != true {
+		t.Errorf("expected downloads_paused true, got %v", stat["downloads_paused"])
+	}
+
+	// 4. Resume all downloads
+	w = env.do("POST", "/api/downloads/resume", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume all downloads status = %d: %s", w.Code, w.Body.String())
+	}
+	dl, _ = env.queries.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPending {
+		t.Errorf("expected pending after resume all, got %q", dl.Status)
+	}
+	w = env.do("GET", "/api/status", "")
+	_ = json.Unmarshal(w.Body.Bytes(), &stat)
+	if stat["downloads_paused"] != false {
+		t.Errorf("expected downloads_paused false, got %v", stat["downloads_paused"])
+	}
+}
+
+func TestPauseAndResumeArtistSyncAPI(t *testing.T) {
+	env := newTestEnv(t)
+
+	artist := &models.Artist{
+		Name:             "Radiohead",
+		Provider:         "test",
+		ProviderID:       "a1",
+		Status:           models.ArtistStatusWatched,
+		WatchNewReleases: true,
+	}
+	if err := env.queries.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Pause artist sync
+	w := env.do("POST", fmt.Sprintf("/api/artists/%d/pause-sync", artist.ID), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause artist sync status = %d: %s", w.Code, w.Body.String())
+	}
+	got, _ := env.queries.GetArtist(artist.ID)
+	if !got.SyncPaused {
+		t.Errorf("expected artist sync_paused to be true")
+	}
+
+	// Syncing a paused artist should return 409 Conflict
+	w = env.do("POST", fmt.Sprintf("/api/artists/%d/sync", artist.ID), "")
+	if w.Code != http.StatusConflict {
+		t.Errorf("expected 409 Conflict when syncing paused artist, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Resume artist sync
+	w = env.do("POST", fmt.Sprintf("/api/artists/%d/resume-sync", artist.ID), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume artist sync status = %d: %s", w.Code, w.Body.String())
+	}
+	got, _ = env.queries.GetArtist(artist.ID)
+	if got.SyncPaused {
+		t.Errorf("expected artist sync_paused to be false")
+	}
+
+	// 3. Pause all sync
+	w = env.do("POST", "/api/artists/pause-sync", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause all sync status = %d: %s", w.Code, w.Body.String())
+	}
+	w = env.do("GET", "/api/status", "")
+	var stat map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &stat)
+	if stat["sync_paused"] != true {
+		t.Errorf("expected global sync_paused true, got %v", stat["sync_paused"])
+	}
+
+	// 4. Resume all sync
+	w = env.do("POST", "/api/artists/resume-sync", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume all sync status = %d: %s", w.Code, w.Body.String())
+	}
+	w = env.do("GET", "/api/status", "")
+	_ = json.Unmarshal(w.Body.Bytes(), &stat)
+	if stat["sync_paused"] != false {
+		t.Errorf("expected global sync_paused false, got %v", stat["sync_paused"])
+	}
+}

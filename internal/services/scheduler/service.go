@@ -104,6 +104,13 @@ func (s *Service) Run(ctx context.Context) {
 // DetectNewReleases checks each artist with watch_new_releases enabled for newly
 // available releases (bypassing stale cache) and heals existing 0-track albums.
 func (s *Service) DetectNewReleases(ctx context.Context) {
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("sync_discography_paused"); err == nil && v == "true" {
+			slog.Debug("scheduler: discography sync paused globally, skipping new releases check")
+			return
+		}
+	}
+
 	artists, err := s.queries.ListWatchedArtists()
 	if err != nil {
 		slog.Error("scheduler: list watched artists", "error", err)
@@ -112,6 +119,10 @@ func (s *Service) DetectNewReleases(ctx context.Context) {
 	for _, artist := range artists {
 		if ctx.Err() != nil {
 			return
+		}
+		if artist.SyncPaused {
+			slog.Debug("scheduler: artist discography sync paused, skipping", "artist", artist.Name)
+			continue
 		}
 		if artist.Status != models.ArtistStatusWatched && artist.WatchNewReleasesSince == nil {
 			continue
@@ -254,6 +265,12 @@ func (s *Service) healAlbumTracks(ctx context.Context, artist *models.Artist, ex
 }
 
 func (s *Service) queueWantedTracks() {
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("downloads_paused"); err == nil && v == "true" {
+			return
+		}
+	}
+
 	cooldownDays := 7
 	if v, err := s.queries.GetSetting("requeue_cooldown_days"); err == nil && v != "" {
 		if d, err := strconv.Atoi(v); err == nil && d >= 0 {
@@ -327,6 +344,12 @@ func (s *Service) checkFileIntegrity() {
 }
 
 func (s *Service) scanForUpgrades() {
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("downloads_paused"); err == nil && v == "true" {
+			return
+		}
+	}
+
 	tiersJSON, err := s.queries.GetSetting("quality_tiers")
 	if err != nil {
 		return

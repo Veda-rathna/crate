@@ -19,6 +19,8 @@ import {
   IconChevronRight,
   IconClose,
   IconDownload,
+  IconPause,
+  IconPlay,
   IconRefresh,
 } from '../components/Icons';
 import type { DownloadProgress, DownloadQueueItem, ActivityLog } from '../types/index';
@@ -35,7 +37,7 @@ export default function Downloads() {
   const [stageFilter, setStageFilter] = useState<string>('all');
   const [selected, setSelected] = useState<DownloadQueueItem | null>(null);
 
-  const { activeTasks, importStatus } = useSystemProcess();
+  const { activeTasks, importStatus, status } = useSystemProcess();
 
   const handleTabChange = (next: 'queue' | 'activity') => {
     setTab(next);
@@ -151,6 +153,46 @@ export default function Downloads() {
     },
   });
 
+  const pauseSingle = useMutation({
+    mutationFn: (id: number) => api.pauseDownload(id),
+    onSuccess: () => {
+      toast('Download paused', 'info');
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeSingle = useMutation({
+    mutationFn: (id: number) => api.resumeDownload(id),
+    onSuccess: () => {
+      toast('Download resumed', 'success');
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const pauseAll = useMutation({
+    mutationFn: () => api.pauseAllDownloads(),
+    onSuccess: (res) => {
+      toast(`Paused all downloads (${res.affected} items paused)`, 'info');
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeAll = useMutation({
+    mutationFn: () => api.resumeAllDownloads(),
+    onSuccess: (res) => {
+      toast(`Resumed all downloads (${res.affected} items resumed)`, 'success');
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
   // Map live transfer progress by download_id and track_id for direct inline display
   const progressByDownloadId = useMemo(() => {
     const map = new Map<number, DownloadProgress>();
@@ -173,6 +215,7 @@ export default function Downloads() {
   const organizing = downloads?.filter((d) => d.status === 'organizing') ?? [];
   const active = [...downloading, ...searching, ...organizing];
   const pending = downloads?.filter((d) => d.status === 'pending') ?? [];
+  const paused = downloads?.filter((d) => d.status === 'paused') ?? [];
   const failed = downloads?.filter((d) => d.status === 'failed') ?? [];
   const complete = downloads?.filter((d) => d.status === 'complete') ?? [];
 
@@ -230,17 +273,63 @@ export default function Downloads() {
           </div>
 
           {tab === 'queue' && (
-            <button
-              type="button"
-              onClick={() => queue.mutate()}
-              disabled={queue.isPending}
-              className="px-3.5 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-50 shrink-0"
-            >
-              {queue.isPending ? 'Queuing…' : 'Queue All Wanted'}
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {status?.downloads_paused ? (
+                <button
+                  type="button"
+                  onClick={() => resumeAll.mutate()}
+                  disabled={resumeAll.isPending}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-50 shrink-0 shadow-sm"
+                  title="Resume all downloads"
+                >
+                  <IconPlay className="w-3.5 h-3.5 fill-current" />
+                  <span>{resumeAll.isPending ? 'Resuming…' : 'Resume Downloads'}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => pauseAll.mutate()}
+                  disabled={pauseAll.isPending || (active.length === 0 && pending.length === 0)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 rounded-xl text-xs font-medium transition-colors disabled:opacity-50 shrink-0"
+                  title="Pause all active and pending downloads"
+                >
+                  <IconPause className="w-3.5 h-3.5" />
+                  <span>{pauseAll.isPending ? 'Pausing…' : 'Pause All'}</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => queue.mutate()}
+                disabled={queue.isPending || status?.downloads_paused}
+                className="px-3.5 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl text-xs font-semibold active:scale-[0.98] transition-all disabled:opacity-50 shrink-0"
+              >
+                {queue.isPending ? 'Queuing…' : 'Queue All Wanted'}
+              </button>
+            </div>
           )}
         </div>
       </div>
+
+      {/* Global Downloads Paused Banner */}
+      {tab === 'queue' && status?.downloads_paused && (
+        <div className="flex items-center justify-between gap-3 p-3.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-200 animate-fade-in">
+          <div className="flex items-center gap-2.5">
+            <IconPause className="w-4 h-4 text-amber-400 shrink-0" />
+            <p className="text-xs font-medium">
+              Downloads are paused — background searches and file transfers will not run until resumed.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => resumeAll.mutate()}
+            disabled={resumeAll.isPending}
+            className="px-3 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 text-xs font-semibold shrink-0 transition-colors"
+          >
+            Resume Downloads
+          </button>
+        </div>
+      )}
 
       {/* Running System Jobs (Syncs / Reconciliations / Imports) */}
       {(activeTasks.length > 0 || importStatus?.status === 'running') && (
@@ -331,7 +420,7 @@ export default function Downloads() {
               )}
             </div>
 
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
               <PipelineCard
                 label="Queued"
                 count={pending.length}
@@ -359,6 +448,13 @@ export default function Downloads() {
                 active={stageFilter === 'active'}
                 onClick={() => setStageFilter(stageFilter === 'active' ? 'all' : 'active')}
                 tone="indigo"
+              />
+              <PipelineCard
+                label="Paused"
+                count={paused.length}
+                active={stageFilter === 'paused'}
+                onClick={() => setStageFilter(stageFilter === 'paused' ? 'all' : 'paused')}
+                tone="amber"
               />
               <PipelineCard
                 label="Failed"
@@ -454,6 +550,28 @@ export default function Downloads() {
                   }
                   onRetry={retry.mutate}
                   onDismiss={dismiss.mutate}
+                  onPause={pauseSingle.mutate}
+                  onResume={resumeSingle.mutate}
+                  onSelect={setSelected}
+                />
+              ))}
+            </Section>
+          )}
+
+          {paused.length > 0 && showSection('paused') && (
+            <Section
+              title={`Paused (${paused.length})`}
+              onClear={() => clearByStatus.mutate('paused')}
+              clearLabel="Clear All"
+            >
+              {paused.map((dl) => (
+                <DownloadRow
+                  key={dl.id}
+                  dl={dl}
+                  onRetry={retry.mutate}
+                  onDismiss={dismiss.mutate}
+                  onPause={pauseSingle.mutate}
+                  onResume={resumeSingle.mutate}
                   onSelect={setSelected}
                 />
               ))}
@@ -472,6 +590,8 @@ export default function Downloads() {
                   dl={dl}
                   onRetry={retry.mutate}
                   onDismiss={dismiss.mutate}
+                  onPause={pauseSingle.mutate}
+                  onResume={resumeSingle.mutate}
                   onSelect={setSelected}
                 />
               ))}
@@ -490,6 +610,8 @@ export default function Downloads() {
                   dl={dl}
                   onRetry={retry.mutate}
                   onDismiss={dismiss.mutate}
+                  onPause={pauseSingle.mutate}
+                  onResume={resumeSingle.mutate}
                   onSelect={setSelected}
                 />
               ))}
@@ -508,6 +630,8 @@ export default function Downloads() {
                   dl={dl}
                   onRetry={retry.mutate}
                   onDismiss={dismiss.mutate}
+                  onPause={pauseSingle.mutate}
+                  onResume={resumeSingle.mutate}
                   onSelect={setSelected}
                 />
               ))}
@@ -632,6 +756,32 @@ export default function Downloads() {
                   className="px-3.5 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-zinc-950 text-xs font-semibold transition-colors"
                 >
                   Retry Now
+                </button>
+              )}
+              {(selected.status === 'pending' || selected.status === 'searching' || selected.status === 'downloading') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    pauseSingle.mutate(selected.id);
+                    setSelected(null);
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-amber-300 text-xs font-semibold transition-colors inline-flex items-center gap-1.5"
+                >
+                  <IconPause className="w-3.5 h-3.5" />
+                  <span>Pause Download</span>
+                </button>
+              )}
+              {selected.status === 'paused' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    resumeSingle.mutate(selected.id);
+                    setSelected(null);
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-semibold transition-colors inline-flex items-center gap-1.5"
+                >
+                  <IconPlay className="w-3.5 h-3.5 fill-current" />
+                  <span>Resume Download</span>
                 </button>
               )}
             </div>
@@ -803,12 +953,16 @@ function DownloadRow({
   liveProgress,
   onRetry,
   onDismiss,
+  onPause,
+  onResume,
   onSelect,
 }: {
   dl: DownloadQueueItem;
   liveProgress?: DownloadProgress;
   onRetry: (id: number) => void;
   onDismiss: (id: number) => void;
+  onPause?: (id: number) => void;
+  onResume?: (id: number) => void;
   onSelect: (dl: DownloadQueueItem) => void;
 }) {
   const trackTitle = dl.track?.title ?? `Track #${dl.track_id}`;
@@ -844,12 +998,47 @@ function DownloadRow({
               {dl.error ? ` · ${dl.error}` : ''}
             </p>
           )}
+          {dl.status === 'paused' && (
+            <p className="text-[11px] text-amber-300/90 mt-1">
+              Download paused
+            </p>
+          )}
           {dl.status === 'failed' && dl.error && (
             <p className="text-[11px] text-rose-300/90 mt-1 truncate">{dl.error}</p>
           )}
         </div>
 
         <StatusBadge status={dl.status} />
+
+        {(dl.status === 'pending' || dl.status === 'searching' || dl.status === 'downloading') && onPause && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onPause(dl.id);
+            }}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] rounded-lg text-xs font-medium text-amber-300 transition-colors shrink-0"
+            title="Pause download"
+          >
+            <IconPause className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Pause</span>
+          </button>
+        )}
+
+        {dl.status === 'paused' && onResume && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onResume(dl.id);
+            }}
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 rounded-lg text-xs font-medium text-emerald-300 transition-colors shrink-0"
+            title="Resume download"
+          >
+            <IconPlay className="w-3.5 h-3.5 fill-current" />
+            <span>Resume</span>
+          </button>
+        )}
 
         {dl.status === 'failed' && (
           <button

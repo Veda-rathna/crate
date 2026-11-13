@@ -294,3 +294,102 @@ func TestSetArtistWatchNewReleasesPreservesExistingSince(t *testing.T) {
 		t.Errorf("expected WatchNewReleasesSince preserved as %q, got %v", since, got.WatchNewReleasesSince)
 	}
 }
+
+func TestArtistSyncPauseAndResume(t *testing.T) {
+	q := newTestQueries(t)
+	artist := &models.Artist{
+		Name:             "Artist 1",
+		Provider:         "test",
+		ProviderID:       "a1",
+		Status:           models.ArtistStatusWatched,
+		WatchNewReleases: true,
+	}
+	if err := q.CreateArtist(artist); err != nil {
+		t.Fatal(err)
+	}
+	if artist.SyncPaused {
+		t.Errorf("expected new artist sync_paused to be false")
+	}
+
+	if err := q.SetArtistSyncPaused(artist.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.SyncPaused {
+		t.Errorf("expected artist sync_paused to be true")
+	}
+
+	if err := q.SetArtistSyncPaused(artist.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err = q.GetArtist(artist.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SyncPaused {
+		t.Errorf("expected artist sync_paused to be false after resume")
+	}
+}
+
+func TestDownloadPauseAndResume(t *testing.T) {
+	q := newTestQueries(t)
+	t1 := seedTrack(t, q)
+
+	dlID, err := q.EnqueueDownloadReturningID(t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause single download
+	if err := q.PauseDownload(dlID); err != nil {
+		t.Fatal(err)
+	}
+	dl, err := q.GetDownload(dlID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dl.Status != models.DownloadStatusPaused {
+		t.Errorf("expected download status 'paused', got %q", dl.Status)
+	}
+
+	// Resume single download
+	if err := q.ResumeDownload(dlID); err != nil {
+		t.Fatal(err)
+	}
+	dl, err = q.GetDownload(dlID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dl.Status != models.DownloadStatusPending {
+		t.Errorf("expected download status 'pending', got %q", dl.Status)
+	}
+
+	// Pause all
+	affected, err := q.PauseAllDownloads()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		t.Errorf("expected 1 affected, got %d", affected)
+	}
+	dl, _ = q.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPaused {
+		t.Errorf("expected paused after PauseAllDownloads, got %q", dl.Status)
+	}
+
+	// Resume all
+	resumed, err := q.ResumeAllDownloads()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed != 1 {
+		t.Errorf("expected 1 resumed, got %d", resumed)
+	}
+	dl, _ = q.GetDownload(dlID)
+	if dl.Status != models.DownloadStatusPending {
+		t.Errorf("expected pending after ResumeAllDownloads, got %q", dl.Status)
+	}
+}

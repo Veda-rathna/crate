@@ -19,6 +19,8 @@ import {
   IconGrip,
   IconLibrary,
   IconLink,
+  IconPause,
+  IconPlay,
   IconRefresh,
   IconSearch,
   IconTrash,
@@ -151,6 +153,28 @@ export default function ArtistDetail() {
           : 'Syncing artist metadata & latest releases…',
         res.status === 'already_syncing' ? 'info' : 'success'
       );
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const pauseSync = useMutation({
+    mutationFn: () => api.pauseArtistSync(artistIdNum),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      toast('Artist discography sync paused', 'info');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeSync = useMutation({
+    mutationFn: () => api.resumeArtistSync(artistIdNum),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['artist', id] });
+      queryClient.invalidateQueries({ queryKey: ['artists'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      toast('Artist discography sync resumed', 'success');
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
@@ -371,11 +395,37 @@ export default function ArtistDetail() {
                         : 'Owned'
                   }
                 />
+                {artist.sync_paused && <StatusBadge status="sync paused" />}
               </div>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {artist.provider !== 'local' && (
+              artist.sync_paused ? (
+                <button
+                  type="button"
+                  onClick={() => resumeSync.mutate()}
+                  disabled={resumeSync.isPending}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-zinc-950 transition-colors shadow-sm disabled:opacity-50"
+                  title="Resume discography syncing for this artist"
+                >
+                  <IconPlay className="w-3.5 h-3.5 fill-current" />
+                  <span>{resumeSync.isPending ? 'Resuming…' : 'Resume Sync'}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => pauseSync.mutate()}
+                  disabled={pauseSync.isPending}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 transition-colors disabled:opacity-50"
+                  title="Pause discography syncing for this artist"
+                >
+                  <IconPause className="w-3.5 h-3.5" />
+                  <span>{pauseSync.isPending ? 'Pausing…' : 'Pause Sync'}</span>
+                </button>
+              )
+            )}
             {artist.provider !== 'local' && (
               <button
                 type="button"

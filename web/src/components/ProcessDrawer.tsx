@@ -163,8 +163,15 @@ export default function ProcessDrawer() {
                 Open Queue <IconChevronRight className="w-3.5 h-3.5" />
               </Link>
             </div>
-            <div className="grid grid-cols-4 gap-2">
+            {status?.downloads_paused && (
+              <div className="mb-2.5 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/25 text-xs text-amber-300 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+                <span className="font-medium">Downloads are paused globally</span>
+              </div>
+            )}
+            <div className="grid grid-cols-5 gap-1.5">
               <StagePill label="Queued" count={status?.pending_downloads ?? 0} tone="zinc" />
+              <StagePill label="Paused" count={status?.paused_downloads ?? 0} tone="amber" />
               <StagePill
                 label="Searching"
                 count={status?.searching_downloads ?? 0}
@@ -296,12 +303,15 @@ function StagePill({
 }: {
   label: string;
   count: number;
-  tone: 'zinc' | 'sky' | 'indigo';
+  tone: 'zinc' | 'sky' | 'indigo' | 'amber';
 }) {
   const active = count > 0;
   const toneStyles = {
     zinc: active
       ? 'bg-amber-500/10 border-amber-500/25 text-amber-200'
+      : 'bg-zinc-900/70 border-white/[0.05] text-zinc-500',
+    amber: active
+      ? 'bg-amber-500/15 border-amber-500/30 text-amber-300'
       : 'bg-zinc-900/70 border-white/[0.05] text-zinc-500',
     sky: active
       ? 'bg-sky-500/10 border-sky-500/25 text-sky-200'
