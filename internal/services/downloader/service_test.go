@@ -18,16 +18,10 @@ import (
 )
 
 func TestRetryDelay(t *testing.T) {
-	expected := []time.Duration{
-		5 * time.Minute,
-		15 * time.Minute,
-		30 * time.Minute,
-		1 * time.Hour,
-	}
-	for i, want := range expected {
+	for i := 0; i < 4; i++ {
 		got := retryDelay(i)
-		if got != want {
-			t.Errorf("retryDelay(%d) = %v, want %v", i, got, want)
+		if got != 1*time.Hour {
+			t.Errorf("retryDelay(%d) = %v, want 1h", i, got)
 		}
 	}
 	if got := retryDelay(10); got != 1*time.Hour {
@@ -35,13 +29,13 @@ func TestRetryDelay(t *testing.T) {
 	}
 }
 
-func TestRetryDelayTotalUnder2Hours(t *testing.T) {
+func TestRetryDelayTotal(t *testing.T) {
 	var total time.Duration
 	for i := 0; i < 4; i++ {
 		total += retryDelay(i)
 	}
-	if total > 2*time.Hour+10*time.Minute {
-		t.Errorf("total retry time %v exceeds 2h10m", total)
+	if total != 4*time.Hour {
+		t.Errorf("total retry time %v, want 4h", total)
 	}
 }
 

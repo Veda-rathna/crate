@@ -194,11 +194,18 @@ const SCHEDULING_FIELDS: FieldDef[] = [
     description: 'Limit how many wanted tracks the scheduler queues per cycle',
   },
   {
-    key: 'requeue_cooldown_days',
-    label: 'Re-queue Cooldown (days)',
-    placeholder: '7',
+    key: 'retry_delay_hours',
+    label: 'Failed Download Retry Delay (hours)',
+    placeholder: '1',
     type: 'number',
-    description: 'Wait this many days before retrying a previously failed track',
+    description: 'Wait this many hours before retrying a failed download attempt',
+  },
+  {
+    key: 'requeue_cooldown_hours',
+    label: 'Re-queue Cooldown (hours)',
+    placeholder: '1',
+    type: 'number',
+    description: 'Wait this many hours before retrying a previously failed track in library',
   },
   {
     key: 'cache_ttl_hours',

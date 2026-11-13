@@ -692,7 +692,7 @@ export default function Downloads() {
               <StatusBadge status={selected.status} />
             </DetailRow>
             <DetailRow label="Process">
-              {selected.status === 'pending' && selected.next_retry_at
+              {(selected.status === 'pending' || selected.status === 'failed') && selected.next_retry_at
                 ? `Waiting for automatic retry (${formatCountdown(selected.next_retry_at)})`
                 : selected.status === 'pending'
                   ? 'Waiting in queue for next available download slot'
@@ -992,19 +992,18 @@ function DownloadRow({
               Tagging audio & moving into library folder…
             </p>
           )}
-          {dl.status === 'pending' && dl.next_retry_at && (
+          {(dl.status === 'pending' || dl.status === 'failed') && dl.next_retry_at ? (
             <p className="text-[11px] text-amber-300/90 mt-1 truncate">
               Retry {dl.attempts}/4 {retryText}
               {dl.error ? ` · ${dl.error}` : ''}
             </p>
-          )}
+          ) : dl.status === 'failed' && dl.error ? (
+            <p className="text-[11px] text-rose-300/90 mt-1 truncate">{dl.error}</p>
+          ) : null}
           {dl.status === 'paused' && (
             <p className="text-[11px] text-amber-300/90 mt-1">
               Download paused
             </p>
-          )}
-          {dl.status === 'failed' && dl.error && (
-            <p className="text-[11px] text-rose-300/90 mt-1 truncate">{dl.error}</p>
           )}
         </div>
 

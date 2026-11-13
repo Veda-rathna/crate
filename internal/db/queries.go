@@ -972,6 +972,14 @@ func (q *Queries) UpdateDownloadStatus(id int64, status models.DownloadStatus, s
 	return e
 }
 
+func (q *Queries) ResetDownloadForRetry(id int64) error {
+	_, err := q.db.Exec(
+		`UPDATE download_queue SET status = 'pending', attempts = 0, error = NULL, next_retry_at = NULL, last_attempt = ? WHERE id = ?`,
+		now(), id,
+	)
+	return err
+}
+
 func (q *Queries) UpdateDownloadProgress(id int64, bytesTransferred int64) error {
 	_, err := q.db.Exec(
 		`UPDATE download_queue SET last_progress_bytes = ?, last_attempt = ? WHERE id = ?`,

@@ -531,7 +531,7 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 		if outcome == arcodNoMatch {
 			errStr := "no match found on arcod"
 			_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
-			return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errStr)
+			return s.failWithRetry(d, errStr)
 		}
 		msg := "arcod download failed"
 		if arcodErr != nil {
@@ -679,7 +679,7 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 		s.logActivity("download_failed", "track", track.ID,
 			fmt.Sprintf("No results for: %s - %s", track.ArtistName, track.Title))
 		_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
-		return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errStr)
+		return s.failWithRetry(d, errStr)
 	}
 
 	slog.Info("downloader: starting download",
@@ -836,9 +836,20 @@ func (s *Service) retryOrganize(d models.DownloadQueueItem) error {
 	return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusComplete, d.SlskdSearchID, nil)
 }
 
+func (s *Service) getRetryDelay(attempts int) time.Duration {
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("retry_delay_hours"); err == nil && v != "" {
+			if h, err := strconv.Atoi(v); err == nil && h > 0 {
+				return time.Duration(h) * time.Hour
+			}
+		}
+	}
+	return retryDelay(attempts)
+}
+
 func (s *Service) failWithRetry(d models.DownloadQueueItem, errMsg string) error {
-	backoff := retryDelay(d.Attempts)
-	// 5m + 15m + 30m + 1h = 1h50m cumulative at attempt 4; stop after ~2h
+	backoff := s.getRetryDelay(d.Attempts)
+	// 1h per attempt; stops after 4 attempts (4h cumulative)
 	if d.Attempts >= 4 {
 		if s.shouldFallbackToArcodAfterSlskd() {
 			if track, err := s.queries.GetTrackWithMeta(d.TrackID); err == nil && track != nil {
@@ -853,8 +864,8 @@ func (s *Service) failWithRetry(d models.DownloadQueueItem, errMsg string) error
 			slog.Info("downloader: removing exhausted scheduler download", "download_id", d.ID)
 			return s.queries.DeleteDownload(d.ID)
 		}
-		slog.Warn("downloader: giving up after 2h of retries", "download_id", d.ID, "attempts", d.Attempts)
-		errFinal := errMsg + " (giving up after 2h)"
+		slog.Warn("downloader: giving up after 4 retry attempts", "download_id", d.ID, "attempts", d.Attempts)
+		errFinal := errMsg + " (giving up after 4 attempts)"
 		return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errFinal)
 	}
 	retryAt := time.Now().UTC().Add(backoff).Format(time.RFC3339)
@@ -867,16 +878,7 @@ func (s *Service) failWithRetry(d models.DownloadQueueItem, errMsg string) error
 }
 
 func retryDelay(attempts int) time.Duration {
-	delays := []time.Duration{
-		5 * time.Minute,
-		15 * time.Minute,
-		30 * time.Minute,
-		1 * time.Hour,
-	}
-	if attempts >= len(delays) {
-		return delays[len(delays)-1]
-	}
-	return delays[attempts]
+	return 1 * time.Hour
 }
 
 func (s *Service) logActivity(action, entityType string, entityID int64, details string) {

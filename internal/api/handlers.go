@@ -1717,7 +1717,7 @@ func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := s.queries.UpdateDownloadStatus(id, models.DownloadStatusPending, nil, nil); err != nil {
+	if err := s.queries.ResetDownloadForRetry(id); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to retry download")
 		return
 	}

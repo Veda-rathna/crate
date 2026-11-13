@@ -69,9 +69,11 @@ func (s *Service) languageResolver() *language.Resolver {
 
 func (s *Service) Run(ctx context.Context) {
 	tick := time.NewTicker(s.interval)
+	wantedTick := time.NewTicker(15 * time.Minute)
 	integrityTick := time.NewTicker(24 * time.Hour)
 	upgradeTick := time.NewTicker(24 * time.Hour)
 	defer tick.Stop()
+	defer wantedTick.Stop()
 	defer integrityTick.Stop()
 	defer upgradeTick.Stop()
 
@@ -90,6 +92,8 @@ func (s *Service) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 			s.DetectNewReleases(ctx)
+			s.queueWantedTracks()
+		case <-wantedTick.C:
 			s.queueWantedTracks()
 		case <-integrityTick.C:
 			s.checkFileIntegrity()
@@ -271,10 +275,14 @@ func (s *Service) queueWantedTracks() {
 		}
 	}
 
-	cooldownDays := 7
-	if v, err := s.queries.GetSetting("requeue_cooldown_days"); err == nil && v != "" {
+	cooldownHours := 1
+	if v, err := s.queries.GetSetting("requeue_cooldown_hours"); err == nil && v != "" {
+		if h, err := strconv.Atoi(v); err == nil && h >= 0 {
+			cooldownHours = h
+		}
+	} else if v, err := s.queries.GetSetting("requeue_cooldown_days"); err == nil && v != "" {
 		if d, err := strconv.Atoi(v); err == nil && d >= 0 {
-			cooldownDays = d
+			cooldownHours = d * 24
 		}
 	}
 
@@ -287,8 +295,8 @@ func (s *Service) queueWantedTracks() {
 
 	var tracks []models.Track
 	var err error
-	if cooldownDays > 0 {
-		cutoff := time.Now().UTC().Add(-time.Duration(cooldownDays) * 24 * time.Hour).Format(time.RFC3339)
+	if cooldownHours > 0 {
+		cutoff := time.Now().UTC().Add(-time.Duration(cooldownHours) * time.Hour).Format(time.RFC3339)
 		tracks, err = s.queries.ListWantedTracksWithCooldown(cutoff, maxQueue)
 	} else {
 		tracks, err = s.queries.ListWantedTracksLimited(maxQueue)
@@ -310,7 +318,7 @@ func (s *Service) queueWantedTracks() {
 		}
 	}
 	if queued > 0 {
-		slog.Info("scheduler: queued wanted tracks", "count", queued, "limit", maxQueue, "cooldown_days", cooldownDays)
+		slog.Info("scheduler: queued wanted tracks", "count", queued, "limit", maxQueue, "cooldown_hours", cooldownHours)
 		s.recordActivity("auto_queued", "library", 0,
 			fmt.Sprintf("Scheduler queued %d wanted track(s)", queued))
 	}
