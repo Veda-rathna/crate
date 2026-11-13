@@ -86,10 +86,10 @@ const ARCOD_FIELDS: FieldDef[] = [
 const SLSKD_FIELDS: FieldDef[] = [
   {
     key: 'max_concurrent_slskd',
-    label: 'Max Concurrent Downloads',
-    placeholder: '10',
+    label: 'Soulseek Max Concurrent Transfers',
+    placeholder: '3',
     type: 'number',
-    description: 'How many files to download from Soulseek simultaneously',
+    description: 'Maximum simultaneous transfers specifically on Soulseek',
   },
   {
     key: 'shadow_ban_duration_minutes',
@@ -186,6 +186,13 @@ const INTEGRATION_SECTIONS: { title: string; fields: FieldDef[] }[] = [
 ];
 
 const SCHEDULING_FIELDS: FieldDef[] = [
+  {
+    key: 'max_concurrent_downloads',
+    label: 'Max Concurrent Downloads',
+    placeholder: '3',
+    type: 'number',
+    description: 'How many songs to download simultaneously in parallel (Arcod & Soulseek)',
+  },
   {
     key: 'max_auto_queue',
     label: 'Max Auto-Queue Per Cycle',

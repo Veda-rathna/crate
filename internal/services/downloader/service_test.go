@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1142,6 +1143,7 @@ func newPriorityTestService(t *testing.T, slskdHandler http.HandlerFunc, fa *fak
 
 	dl := NewService(q, slskd.NewClient(srv.URL, "key"), &noopTestOrganizer{}, nil)
 	dl.SetDownloadsDir(t.TempDir())
+	dl.SetSyncMode(true)
 	if fa != nil {
 		dl.SetArcod(fa)
 	}
@@ -1362,5 +1364,196 @@ func TestArcodRateLimitDefersWithoutBurningAttemptAndPausesTick(t *testing.T) {
 	delta := time.Until(retryAt)
 	if delta < 50*time.Second || delta > 70*time.Second {
 		t.Errorf("expected deferred retry around ~62s, got %v", delta)
+	}
+}
+
+type blockingArcodProvider struct {
+	mu           sync.Mutex
+	started      map[int64]chan struct{}
+	releaseBlock chan struct{}
+	downloaded   map[int64]bool
+	canceled     map[int64]bool
+}
+
+func newBlockingArcodProvider() *blockingArcodProvider {
+	return &blockingArcodProvider{
+		started:      make(map[int64]chan struct{}),
+		releaseBlock: make(chan struct{}),
+		downloaded:   make(map[int64]bool),
+		canceled:     make(map[int64]bool),
+	}
+}
+
+func (b *blockingArcodProvider) Search(ctx context.Context, query string) ([]arcod.TrackItem, error) {
+	return nil, nil
+}
+func (b *blockingArcodProvider) FindBestTrack(ctx context.Context, artistName, trackTitle string) (*arcod.TrackItem, error) {
+	return &arcod.TrackItem{ID: 100, Title: trackTitle, Artist: artistName}, nil
+}
+func (b *blockingArcodProvider) FindBestTrackMatch(ctx context.Context, q arcod.MatchQuery) (*arcod.TrackItem, error) {
+	b.mu.Lock()
+	id := int64(len(b.started) + 101)
+	ch := make(chan struct{})
+	b.started[id] = ch
+	b.mu.Unlock()
+	return &arcod.TrackItem{ID: id, Title: q.Title, Artist: q.Artist}, nil
+}
+func (b *blockingArcodProvider) DownloadTrack(ctx context.Context, trackID int64, quality int, destPath string) (int64, error) {
+	b.mu.Lock()
+	ch := b.started[trackID]
+	b.mu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		b.mu.Lock()
+		b.canceled[trackID] = true
+		b.mu.Unlock()
+		return 0, ctx.Err()
+	case <-b.releaseBlock:
+		b.mu.Lock()
+		b.downloaded[trackID] = true
+		b.mu.Unlock()
+		_ = os.WriteFile(destPath, []byte("fLaCdummy"), 0644)
+		return 1000, nil
+	}
+}
+func (b *blockingArcodProvider) IsEnabled() bool {
+	return true
+}
+
+func TestParallelDownloadsConcurrencyAndCancellation(t *testing.T) {
+	bp := newBlockingArcodProvider()
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	q := db.NewQueries(database)
+
+	artist := &models.Artist{Name: "Artist", Provider: "test", ProviderID: "a1", Status: models.ArtistStatusWatched}
+	_ = q.CreateArtist(artist)
+	album := &models.Album{ArtistID: artist.ID, Title: "Album", Provider: "test", ProviderID: "al1", RecordType: "album", Status: models.AlbumStatusWatched}
+	_ = q.CreateAlbum(album)
+
+	tr1 := &models.Track{AlbumID: album.ID, Title: "Track 1", TrackNumber: 1, DiscNumber: 1, Provider: "test", ProviderID: "t1", Status: models.TrackStatusWanted}
+	tr2 := &models.Track{AlbumID: album.ID, Title: "Track 2", TrackNumber: 2, DiscNumber: 1, Provider: "test", ProviderID: "t2", Status: models.TrackStatusWanted}
+	tr3 := &models.Track{AlbumID: album.ID, Title: "Track 3", TrackNumber: 3, DiscNumber: 1, Provider: "test", ProviderID: "t3", Status: models.TrackStatusWanted}
+	_ = q.CreateTrack(tr1)
+	_ = q.CreateTrack(tr2)
+	_ = q.CreateTrack(tr3)
+
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srv.Close)
+
+	dl := NewService(q, slskd.NewClient(srv.URL, "key"), &noopTestOrganizer{}, nil)
+	dl.SetDownloadsDir(t.TempDir())
+	dl.SetArcod(bp)
+	dl.SetSyncMode(false) // parallel mode
+
+	_ = q.SetSetting("max_concurrent_downloads", "2")
+	_ = q.EnqueueDownload(tr1.ID)
+	_ = q.EnqueueDownload(tr2.ID)
+	_ = q.EnqueueDownload(tr3.ID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Initial tick should pick 2 items (concurrency limit = 2)
+	dl.tick(ctx)
+
+	// Wait for 2 jobs to transition to downloading
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		downloading, _ := q.ListDownloads("downloading")
+		if len(downloading) == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if count := dl.ActiveJobCount(); count != 2 {
+		t.Fatalf("expected 2 active parallel jobs, got %d", count)
+	}
+
+	// In DB, 2 downloads should be downloading, and 1 should remain pending
+	downloading, _ := q.ListDownloads("downloading")
+	pending, _ := q.ListDownloads("pending")
+	if len(downloading) != 2 {
+		t.Fatalf("expected 2 downloading items in DB, got %d", len(downloading))
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 remaining pending item in DB, got %d", len(pending))
+	}
+
+	// Cancel one of the active downloads
+	firstActive := downloading[0]
+	dl.CancelTransfer(ctx, &firstActive)
+
+	// Wait for cancellation to register
+	time.Sleep(50 * time.Millisecond)
+
+	bp.mu.Lock()
+	canceledCount := len(bp.canceled)
+	bp.mu.Unlock()
+	if canceledCount != 1 {
+		t.Errorf("expected 1 canceled Arcod download, got %d", canceledCount)
+	}
+
+	// Release block so running job can finish
+	close(bp.releaseBlock)
+	dl.WaitActive()
+
+	// After release, 1 job finished, 1 canceled. Pending track (tr3) should now be picked on next tick
+	dl.tick(ctx)
+	dl.WaitActive()
+
+	complete, _ := q.ListDownloads("complete")
+	if len(complete) < 1 {
+		t.Errorf("expected at least 1 completed download, got %d", len(complete))
+	}
+}
+
+func TestGetMaxConcurrentDownloadsSetting(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	q := db.NewQueries(database)
+	dl := NewService(q, nil, &noopTestOrganizer{}, nil)
+
+	// Default seeded by migration 015 is 3
+	if n := dl.getMaxConcurrent(); n != 3 {
+		t.Errorf("expected default 3, got %d", n)
+	}
+
+	// When max_concurrent_downloads is cleared, max_concurrent_slskd fallback is used
+	_ = q.SetSetting("max_concurrent_downloads", "")
+	_ = q.SetSetting("max_concurrent_slskd", "7")
+	if n := dl.getMaxConcurrent(); n != 7 {
+		t.Errorf("expected 7 from slskd, got %d", n)
+	}
+
+	// When max_concurrent_downloads is set, it takes priority
+	_ = q.SetSetting("max_concurrent_downloads", "4")
+	if n := dl.getMaxConcurrent(); n != 4 {
+		t.Errorf("expected 4 from max_concurrent_downloads, got %d", n)
+	}
+
+	// Invalid value falls back
+	_ = q.SetSetting("max_concurrent_downloads", "-1")
+	if n := dl.getMaxConcurrent(); n != 7 {
+		t.Errorf("expected 7 fallback from invalid value, got %d", n)
 	}
 }

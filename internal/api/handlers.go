@@ -1925,6 +1925,13 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if v, ok := settings["max_concurrent_downloads"]; ok && strings.TrimSpace(v) != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n < 1 || n > 20 {
+			writeError(w, http.StatusBadRequest, "invalid max_concurrent_downloads: must be a number between 1 and 20")
+			return
+		}
+	}
 	for k, v := range settings {
 		if hiddenSettings[k] {
 			continue

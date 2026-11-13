@@ -920,7 +920,7 @@ func (q *Queries) EnqueueDownloadBatch(trackIDs []int64) (int, error) {
 func (q *Queries) CountActiveDownloads() (int, error) {
 	var count int
 	err := q.db.QueryRow(
-		`SELECT COUNT(*) FROM download_queue WHERE status IN ('searching', 'downloading')`,
+		`SELECT COUNT(*) FROM download_queue WHERE status IN ('searching', 'downloading', 'organizing')`,
 	).Scan(&count)
 	return count, err
 }

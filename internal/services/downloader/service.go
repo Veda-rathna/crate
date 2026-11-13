@@ -24,7 +24,8 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/services/slskd"
 )
 
-const defaultMaxConcurrentSlskd = 10
+const defaultMaxConcurrentDownloads = 3
+const defaultMaxConcurrentSlskd = 3
 
 const (
 	SourceArcod = "arcod"
@@ -115,10 +116,116 @@ type Service struct {
 	arcod            ArcodProvider
 	downloadsDir     string
 	arcodSearchCache sync.Map
+
+	activeJobs         map[int64]context.CancelFunc
+	jobsMu             sync.Mutex
+	jobsWg             sync.WaitGroup
+	syncMode           bool
+	arcodCooldownUntil time.Time
 }
 
 func NewService(queries *db.Queries, slskdClient *slskd.Client, org Organizer, actLog *activity.Log) *Service {
-	return &Service{queries: queries, slskd: slskdClient, organizer: org, activityLog: actLog}
+	return &Service{
+		queries:     queries,
+		slskd:       slskdClient,
+		organizer:   org,
+		activityLog: actLog,
+		activeJobs:  make(map[int64]context.CancelFunc),
+	}
+}
+
+func (s *Service) SetSyncMode(sync bool) {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	s.syncMode = sync
+}
+
+func (s *Service) IsSyncMode() bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	return s.syncMode
+}
+
+func (s *Service) SetArcodCooldown(until time.Time) {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	s.arcodCooldownUntil = until
+}
+
+func (s *Service) IsArcodInCooldown() bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	return time.Now().Before(s.arcodCooldownUntil)
+}
+
+func (s *Service) registerJob(id int64, cancel context.CancelFunc) bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	if s.activeJobs == nil {
+		s.activeJobs = make(map[int64]context.CancelFunc)
+	}
+	if _, exists := s.activeJobs[id]; exists {
+		return false
+	}
+	s.activeJobs[id] = cancel
+	return true
+}
+
+func (s *Service) unregisterJob(id int64) {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	if s.activeJobs != nil {
+		delete(s.activeJobs, id)
+	}
+}
+
+func (s *Service) IsJobActive(id int64) bool {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	if s.activeJobs == nil {
+		return false
+	}
+	_, ok := s.activeJobs[id]
+	return ok
+}
+
+func (s *Service) ActiveJobCount() int {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	return len(s.activeJobs)
+}
+
+func (s *Service) cancelJob(id int64) bool {
+	s.jobsMu.Lock()
+	cancel, ok := s.activeJobs[id]
+	if ok {
+		delete(s.activeJobs, id)
+	}
+	s.jobsMu.Unlock()
+	if ok && cancel != nil {
+		cancel()
+		return true
+	}
+	return false
+}
+
+func (s *Service) cancelAllJobs() {
+	s.jobsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.activeJobs))
+	for id, cancel := range s.activeJobs {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		delete(s.activeJobs, id)
+	}
+	s.jobsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (s *Service) WaitActive() {
+	s.jobsWg.Wait()
 }
 
 func (s *Service) SetArcod(a ArcodProvider) {
@@ -152,6 +259,8 @@ func (s *Service) Notifiers() []PostDownloadNotifier {
 }
 
 func (s *Service) CancelTransfer(ctx context.Context, d *models.DownloadQueueItem) {
+	s.cancelJob(d.ID)
+
 	if d.SlskdSearchID == nil {
 		return
 	}
@@ -254,6 +363,7 @@ func (s *Service) IsQueuePaused() bool {
 }
 
 func (s *Service) CancelAllActive(ctx context.Context) {
+	s.cancelAllJobs()
 	downloading, _ := s.queries.ListDownloads("downloading")
 	for _, d := range downloading {
 		s.CancelTransfer(ctx, &d)
@@ -302,6 +412,10 @@ func (s *Service) tick(ctx context.Context) {
 		slog.Error("downloader: count active", "error", err)
 		activeCount = 0
 	}
+	jobCount := s.ActiveJobCount()
+	if jobCount > activeCount {
+		activeCount = jobCount
+	}
 	slots := maxConcurrent - activeCount
 
 	pending, err := s.queries.ListDownloads("pending")
@@ -309,8 +423,19 @@ func (s *Service) tick(ctx context.Context) {
 		slog.Error("downloader: list pending", "error", err)
 		return
 	}
+
+	sources := s.enabledSources()
+	arcodPrimaryWithoutFallback := len(sources) > 0 && sources[0] == SourceArcod && !s.isSlskdEnabled()
+
 	for _, d := range pending {
 		if slots <= 0 {
+			break
+		}
+		if s.IsJobActive(d.ID) {
+			continue
+		}
+		if arcodPrimaryWithoutFallback && s.IsArcodInCooldown() {
+			slog.Info("downloader: arcod in rate limit cooldown, skipping pending batch")
 			break
 		}
 		if d.Attempts >= 4 {
@@ -326,15 +451,47 @@ func (s *Service) tick(ctx context.Context) {
 			s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &reason)
 			continue
 		}
-		if err := s.process(ctx, d); err != nil {
-			var rlErr *arcod.RateLimitError
-			if errors.As(err, &rlErr) {
-				slog.Info("downloader: pausing pending batch for arcod rate limit cooldown", "retry_after", rlErr.RetryAfter)
-				break
+
+		if s.IsSyncMode() {
+			slots--
+			if err := s.process(ctx, d); err != nil {
+				var rlErr *arcod.RateLimitError
+				if errors.As(err, &rlErr) {
+					slog.Info("downloader: pausing pending batch for arcod rate limit cooldown", "retry_after", rlErr.RetryAfter)
+					break
+				}
+				slog.Error("downloader: process", "download_id", d.ID, "error", err)
 			}
-			slog.Error("downloader: process", "download_id", d.ID, "error", err)
+			continue
+		}
+
+		jobCtx, cancel := context.WithCancel(ctx)
+		if !s.registerJob(d.ID, cancel) {
+			cancel()
+			continue
 		}
 		slots--
+
+		s.jobsWg.Add(1)
+		go func(item models.DownloadQueueItem, c context.CancelFunc) {
+			defer func() {
+				s.unregisterJob(item.ID)
+				c()
+				s.jobsWg.Done()
+			}()
+
+			if err := s.process(jobCtx, item); err != nil {
+				if jobCtx.Err() != nil {
+					return
+				}
+				var rlErr *arcod.RateLimitError
+				if errors.As(err, &rlErr) {
+					slog.Info("downloader: arcod rate limit encountered", "retry_after", rlErr.RetryAfter)
+					return
+				}
+				slog.Error("downloader: process", "download_id", item.ID, "error", err)
+			}
+		}(d, cancel)
 	}
 
 	searching, err := s.queries.ListDownloads("searching")
@@ -401,15 +558,19 @@ func (s *Service) getScoringConfig() scoringConfig {
 }
 
 func (s *Service) getMaxConcurrent() int {
-	v, err := s.queries.GetSetting("max_concurrent_slskd")
-	if err != nil {
-		return defaultMaxConcurrentSlskd
+	if s.queries != nil {
+		if v, err := s.queries.GetSetting("max_concurrent_downloads"); err == nil && v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+				return n
+			}
+		}
+		if v, err := s.queries.GetSetting("max_concurrent_slskd"); err == nil && v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+				return n
+			}
+		}
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return defaultMaxConcurrentSlskd
-	}
-	return n
+	return defaultMaxConcurrentDownloads
 }
 
 func (s *Service) isArcodEnabled() bool {
@@ -493,6 +654,7 @@ func (s *Service) deferRateLimitedRetry(d models.DownloadQueueItem, err error) e
 	if errors.As(err, &rlErr) && rlErr.RetryAfter > 0 {
 		wait = rlErr.RetryAfter + 2*time.Second
 	}
+	s.SetArcodCooldown(time.Now().Add(wait))
 	retryAt := time.Now().UTC().Add(wait).Format(time.RFC3339)
 	slog.Info("downloader: arcod rate limited, deferring retry without counting attempt",
 		"download_id", d.ID, "retry_in", wait.Round(time.Second))
@@ -502,6 +664,9 @@ func (s *Service) deferRateLimitedRetry(d models.DownloadQueueItem, err error) e
 
 // process kicks off a download attempt across enabled sources in priority order.
 func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error {
+	if ctx.Err() != nil {
+		return nil
+	}
 	track, err := s.queries.GetTrackWithMeta(d.TrackID)
 	if err != nil {
 		return err
@@ -516,6 +681,9 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 
 	if sources[0] == SourceArcod {
 		outcome, arcodErr := s.tryArcodDownload(ctx, d, track)
+		if ctx.Err() != nil {
+			return nil
+		}
 		if outcome == arcodDownloaded || outcome == arcodOrganizePending {
 			return nil
 		}
@@ -542,8 +710,14 @@ func (s *Service) process(ctx context.Context, d models.DownloadQueueItem) error
 
 	// Primary is slskd.
 	if err := s.startSlskdSearch(ctx, d, track); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if s.isArcodEnabled() {
 			outcome, arcodErr := s.tryArcodDownload(ctx, d, track)
+			if ctx.Err() != nil {
+				return nil
+			}
 			if outcome == arcodDownloaded || outcome == arcodOrganizePending {
 				return nil
 			}
@@ -611,8 +785,12 @@ func (s *Service) tryArcodDownload(ctx context.Context, d models.DownloadQueueIt
 
 	_, err = s.arcod.DownloadTrack(ctx, arcodTrack.ID, arcod.DefaultQuality, destPath)
 	if err != nil {
-		slog.Warn("downloader: arcod stream download failed", "error", err, "track_id", track.ID)
 		_ = os.Remove(destPath)
+		if ctx.Err() != nil {
+			slog.Info("downloader: arcod download aborted (canceled)", "track_id", track.ID)
+			return arcodFailed, ctx.Err()
+		}
+		slog.Warn("downloader: arcod stream download failed", "error", err, "track_id", track.ID)
 		_ = s.queries.UpdateTrackStatus(track.ID, models.TrackStatusWanted)
 		return arcodFailed, err
 	}
@@ -643,6 +821,9 @@ func (s *Service) checkSearch(ctx context.Context, d models.DownloadQueueItem) e
 	if d.SlskdSearchID == nil {
 		errStr := "missing search id"
 		return s.queries.UpdateDownloadStatus(d.ID, models.DownloadStatusFailed, nil, &errStr)
+	}
+	if strings.HasPrefix(*d.SlskdSearchID, "arcod|") {
+		return nil
 	}
 
 	search, err := s.slskd.GetSearch(ctx, *d.SlskdSearchID)
