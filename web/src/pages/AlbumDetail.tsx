@@ -19,6 +19,8 @@ import ConfirmModal from '../components/ConfirmModal';
 import {
   IconDisc,
   IconLink,
+  IconPause,
+  IconPlay,
   IconRefresh,
   IconSearch,
   IconTrash,
@@ -121,6 +123,28 @@ export default function AlbumDetail() {
     return map;
   }, [progress]);
 
+  const albumActiveCount = useMemo(() => {
+    let count = 0;
+    for (const t of album?.tracks ?? []) {
+      const q = downloadByTrackId.get(t.id);
+      if (q && (q.status === 'pending' || q.status === 'searching' || q.status === 'downloading')) {
+        count++;
+      }
+    }
+    return count;
+  }, [album?.tracks, downloadByTrackId]);
+
+  const albumPausedCount = useMemo(() => {
+    let count = 0;
+    for (const t of album?.tracks ?? []) {
+      const q = downloadByTrackId.get(t.id);
+      if (q && q.status === 'paused') {
+        count++;
+      }
+    }
+    return count;
+  }, [album?.tracks, downloadByTrackId]);
+
   const unwatchAlbum = useMutation({
     mutationFn: () => api.unwatchAlbum(Number(id)),
     onSuccess: () => {
@@ -208,6 +232,64 @@ export default function AlbumDetail() {
       );
       queryClient.invalidateQueries({ queryKey: ['downloads'] });
       queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const pauseDownload = useMutation({
+    mutationFn: (downloadId: number) => api.pauseDownload(downloadId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['album', id] });
+      toast('Download paused', 'info');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeDownload = useMutation({
+    mutationFn: (downloadId: number) => api.resumeDownload(downloadId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['album', id] });
+      toast('Download resumed', 'success');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const pauseAlbumDownloads = useMutation({
+    mutationFn: async () => {
+      const activeOrPending =
+        downloads?.filter(
+          (d) =>
+            d.track?.album_id === Number(id) &&
+            (d.status === 'pending' || d.status === 'searching' || d.status === 'downloading')
+        ) || [];
+      await Promise.all(activeOrPending.map((d) => api.pauseDownload(d.id)));
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['album', id] });
+      toast('Album downloads paused', 'info');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const resumeAlbumDownloads = useMutation({
+    mutationFn: async () => {
+      const pausedInAlbum =
+        downloads?.filter(
+          (d) => d.track?.album_id === Number(id) && d.status === 'paused'
+        ) || [];
+      await Promise.all(pausedInAlbum.map((d) => api.resumeDownload(d.id)));
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['downloads'] });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+      queryClient.invalidateQueries({ queryKey: ['album', id] });
+      toast('Album downloads resumed', 'success');
     },
     onError: (err: Error) => toast(err.message, 'error'),
   });
@@ -460,21 +542,47 @@ export default function AlbumDetail() {
             <div className="flex-1">
               <ProgressBar owned={stats.ownedTracks} total={stats.totalTracks} showPct />
             </div>
-            {stats.wantedTracks > 0 && (
-              <button
-                type="button"
-                onClick={() => queueAll.mutate()}
-                disabled={queueAll.isPending || queueAll.isSuccess}
-                className="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl font-semibold text-xs active:scale-[0.98] transition-all disabled:opacity-60 flex items-center justify-center gap-1.5 shrink-0"
-              >
-                <IconSearch className="w-3.5 h-3.5" />
-                {queueAll.isSuccess
-                  ? 'Queued!'
-                  : queueAll.isPending
-                    ? 'Queuing…'
-                    : `Queue ${stats.wantedTracks} Wanted`}
-              </button>
-            )}
+            <div className="flex items-center gap-2 shrink-0">
+              {albumPausedCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => resumeAlbumDownloads.mutate()}
+                  disabled={resumeAlbumDownloads.isPending}
+                  className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 rounded-xl font-semibold text-xs active:scale-[0.98] transition-all disabled:opacity-60 flex items-center justify-center gap-1.5 shrink-0"
+                  title="Resume all paused downloads for this album"
+                >
+                  <IconPlay className="w-3.5 h-3.5 fill-current" />
+                  <span>{resumeAlbumDownloads.isPending ? 'Resuming…' : `Resume (${albumPausedCount})`}</span>
+                </button>
+              )}
+              {albumActiveCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => pauseAlbumDownloads.mutate()}
+                  disabled={pauseAlbumDownloads.isPending}
+                  className="px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-amber-300 rounded-xl font-medium text-xs active:scale-[0.98] transition-all disabled:opacity-60 flex items-center justify-center gap-1.5 shrink-0"
+                  title="Pause all active/pending downloads for this album"
+                >
+                  <IconPause className="w-3.5 h-3.5" />
+                  <span>{pauseAlbumDownloads.isPending ? 'Pausing…' : `Pause (${albumActiveCount})`}</span>
+                </button>
+              )}
+              {stats.wantedTracks > 0 && (
+                <button
+                  type="button"
+                  onClick={() => queueAll.mutate()}
+                  disabled={queueAll.isPending || queueAll.isSuccess}
+                  className="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-zinc-950 rounded-xl font-semibold text-xs active:scale-[0.98] transition-all disabled:opacity-60 flex items-center justify-center gap-1.5 shrink-0"
+                >
+                  <IconSearch className="w-3.5 h-3.5" />
+                  {queueAll.isSuccess
+                    ? 'Queued!'
+                    : queueAll.isPending
+                      ? 'Queuing…'
+                      : `Queue ${stats.wantedTracks} Wanted`}
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -661,7 +769,31 @@ export default function AlbumDetail() {
                         )}
 
                         {track.status !== 'owned' && queueItem && (
-                          <StatusBadge status={queueItem.status} />
+                          <div className="flex items-center gap-1.5">
+                            <StatusBadge status={queueItem.status} />
+                            {(queueItem.status === 'pending' || queueItem.status === 'searching' || queueItem.status === 'downloading') && (
+                              <button
+                                type="button"
+                                onClick={() => pauseDownload.mutate(queueItem.id)}
+                                disabled={pauseDownload.isPending}
+                                className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-amber-300 transition-colors"
+                                title="Pause download"
+                              >
+                                <IconPause className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {queueItem.status === 'paused' && (
+                              <button
+                                type="button"
+                                onClick={() => resumeDownload.mutate(queueItem.id)}
+                                disabled={resumeDownload.isPending}
+                                className="p-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 transition-colors"
+                                title="Resume download"
+                              >
+                                <IconPlay className="w-3.5 h-3.5 fill-current" />
+                              </button>
+                            )}
+                          </div>
                         )}
 
                         {track.status !== 'owned' && !queueItem && (
@@ -952,6 +1084,35 @@ export default function AlbumDetail() {
 
             {/* Track Actions */}
             <div className="flex flex-wrap gap-2 pt-4 mt-2 border-t border-white/[0.06]">
+              {selectedQueueItem &&
+                (selectedQueueItem.status === 'pending' ||
+                  selectedQueueItem.status === 'searching' ||
+                  selectedQueueItem.status === 'downloading') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      pauseDownload.mutate(selectedQueueItem.id);
+                      setSelectedTrack(null);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-amber-300 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                  >
+                    <IconPause className="w-3.5 h-3.5" />
+                    <span>Pause Download</span>
+                  </button>
+                )}
+              {selectedQueueItem && selectedQueueItem.status === 'paused' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    resumeDownload.mutate(selectedQueueItem.id);
+                    setSelectedTrack(null);
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                >
+                  <IconPlay className="w-3.5 h-3.5 fill-current" />
+                  <span>Resume Download</span>
+                </button>
+              )}
               {(selectedTrack.status === 'wanted' || selectedTrack.status === 'ignored') && (
                 <>
                   <button

@@ -1,5 +1,6 @@
 services:
   crate:
+    image: crate:language-filter
     build: .
     ports:
       - "6969:6969"

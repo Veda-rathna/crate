@@ -14,7 +14,7 @@ interface QualityTier {
   label: string;
 }
 
-type SettingsTab = 'all' | 'providers' | 'library' | 'downloads' | 'integrations' | 'maintenance';
+type SettingsTab = 'all' | 'arcod' | 'providers' | 'library' | 'downloads' | 'integrations' | 'maintenance';
 type DownloadSource = 'arcod' | 'slskd';
 
 const DEFAULT_SOURCE_PRIORITY: DownloadSource[] = ['arcod', 'slskd'];
@@ -508,9 +508,10 @@ export default function Settings() {
         {(
           [
             { id: 'all', label: 'All Settings' },
+            { id: 'arcod', label: `Arcod Accounts (${arcodAccounts.length})` },
+            { id: 'downloads', label: 'Downloaders & Quality' },
             { id: 'providers', label: 'Providers' },
             { id: 'library', label: 'Library & Import' },
-            { id: 'downloads', label: 'Downloaders & Quality' },
             { id: 'integrations', label: 'Integrations' },
             { id: 'maintenance', label: 'Scheduling & Blocks' },
           ] as const
@@ -835,10 +836,11 @@ export default function Settings() {
       )}
 
       {/* Downloaders & Quality */}
-      {showSection('downloads') && (
+      {(showSection('downloads') || activeTab === 'arcod') && (
         <div className="space-y-5">
-          <SettingsSection
-            title="Download Source Priority"
+          {showSection('downloads') && (
+            <SettingsSection
+              title="Download Source Priority"
             description="Choose which download source Crate tries first and enable or disable individual services. If the primary source finds no match or fails, Crate falls back to the next enabled source."
           >
             <div className="space-y-2">
@@ -935,6 +937,7 @@ export default function Settings() {
               </div>
             )}
           </SettingsSection>
+          )}
 
           <SettingsSection
             title="Arcod"
@@ -1095,7 +1098,9 @@ export default function Settings() {
             </div>
           </SettingsSection>
 
-          <SettingsSection title="slskd (Soulseek)">
+          {showSection('downloads') && (
+            <>
+              <SettingsSection title="slskd (Soulseek)">
             <label className="flex items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl px-3.5 py-3 mb-3 cursor-pointer">
               <div>
                 <p className="text-sm font-medium text-zinc-100">Enable slskd</p>
@@ -1345,6 +1350,8 @@ export default function Settings() {
               </button>
             </div>
           </SettingsSection>
+            </>
+          )}
         </div>
       )}
 

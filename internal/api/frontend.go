@@ -14,11 +14,19 @@ func SPAHandler(fsys fs.FS) http.HandlerFunc {
 
 		if f, err := fsys.Open(path); err == nil {
 			f.Close()
+			if path == "" || path == "index.html" {
+				w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+				w.Header().Set("Pragma", "no-cache")
+				w.Header().Set("Expires", "0")
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
 
 		r.URL.Path = "/"
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		fileServer.ServeHTTP(w, r)
 	}
 }

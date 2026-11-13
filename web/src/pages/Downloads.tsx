@@ -1020,7 +1020,7 @@ function DownloadRow({
             title="Pause download"
           >
             <IconPause className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Pause</span>
+            <span>Pause</span>
           </button>
         )}
 
