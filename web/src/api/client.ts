@@ -1,4 +1,4 @@
-import type { Artist, Album, Track, SearchResponse, BrowseArtistResult, BrowseAlbumDetail, DownloadQueueItem, DownloadProgress, SystemStatus, ProviderInfo, ActivityResponse, ManualSearchStart, ManualSearchResponse, LibrarySearchResult, TrackSearchResult, BlacklistEntry, UserCooldown, ImportState } from '../types/index';
+import type { Artist, Album, Track, SearchResponse, BrowseArtistResult, BrowseAlbumDetail, DownloadQueueItem, DownloadProgress, SystemStatus, ProviderInfo, ActivityResponse, ManualSearchStart, ManualSearchResponse, LibrarySearchResult, TrackSearchResult, BlacklistEntry, UserCooldown, ImportState, ArcodAccount } from '../types/index';
 
 const BASE = '/api';
 
@@ -180,4 +180,29 @@ export const api = {
   deleteCooldown: (id: number) =>
     request<void>(`/cooldowns/${id}`, { method: 'DELETE' }),
   clearCooldowns: () => request<void>('/cooldowns', { method: 'DELETE' }),
+
+  listArcodAccounts: () =>
+    request<{ accounts: ArcodAccount[] }>('/settings/arcod/accounts'),
+  addArcodAccount: (data: { email: string; password: string; token?: string }) =>
+    request<ArcodAccount>('/settings/arcod/accounts', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  autoCreateArcodAccount: () =>
+    request<ArcodAccount>('/settings/arcod/accounts/auto-create', {
+      method: 'POST',
+    }),
+  updateArcodAccount: (id: string, data: { email?: string; password?: string; token?: string }) =>
+    request<ArcodAccount>(`/settings/arcod/accounts/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteArcodAccount: (id: string) =>
+    request<void>(`/settings/arcod/accounts/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  testArcodAccount: (id: string) =>
+    request<{ success: boolean; message: string }>(`/settings/arcod/accounts/${encodeURIComponent(id)}/test`, {
+      method: 'POST',
+    }),
 };

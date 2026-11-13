@@ -110,6 +110,34 @@ type cachedSearch struct {
 	expiresAt time.Time
 }
 
+// Account represents an individual arcod.xyz account within Crate's account pool.
+type Account struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Password  string    `json:"password"`
+	Token     string    `json:"token,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+
+	RateLimitedUntil time.Time     `json:"-"`
+	LastUsedAt       time.Time     `json:"-"`
+	LastError        string        `json:"-"`
+	Limiter          *rate.Limiter `json:"-"`
+}
+
+// AccountInfo is the sanitized representation returned across the API.
+type AccountInfo struct {
+	ID               string     `json:"id"`
+	Email            string     `json:"email"`
+	HasPassword      bool       `json:"has_password"`
+	HasToken         bool       `json:"has_token"`
+	CreatedAt        time.Time  `json:"created_at"`
+	Status           string     `json:"status"` // "active", "rate_limited", "error"
+	RateLimitedUntil *time.Time `json:"rate_limited_until,omitempty"`
+	CooldownSeconds  int        `json:"cooldown_seconds"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	LastError        string     `json:"last_error,omitempty"`
+}
+
 type Client struct {
 	queries          *db.Queries
 	downloadsDir     string
@@ -121,6 +149,9 @@ type Client struct {
 	rateLimitedUntil time.Time
 	searchCache      map[string]cachedSearch
 	albumCache       map[string]cachedSearch
+
+	accountsMu sync.RWMutex
+	accounts   []*Account
 }
 
 func NewClient(queries *db.Queries, downloadsDir string) *Client {
@@ -130,6 +161,7 @@ func NewClient(queries *db.Queries, downloadsDir string) *Client {
 		searchLimiter: rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
 		searchCache:   make(map[string]cachedSearch),
 		albumCache:    make(map[string]cachedSearch),
+		accounts:      make([]*Account, 0),
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -173,7 +205,7 @@ func (c *Client) IsEnabled() bool {
 	return true
 }
 
-func (c *Client) getCredentials() (email, password, token string) {
+func (c *Client) getLegacyCredentials() (email, password, token string) {
 	if c.queries != nil {
 		email, _ = c.queries.GetSetting("arcod_email")
 		password, _ = c.queries.GetSetting("arcod_password")
@@ -191,7 +223,445 @@ func (c *Client) getCredentials() (email, password, token string) {
 	return strings.TrimSpace(email), strings.TrimSpace(password), strings.TrimSpace(token)
 }
 
-// EnsureAuthenticated ensures a valid auth token is available.
+func (c *Client) loadAccountsLocked() {
+	if c.queries != nil {
+		v, err := c.queries.GetSetting("arcod_accounts")
+		if err == nil && strings.TrimSpace(v) != "" {
+			var list []*Account
+			if err := json.Unmarshal([]byte(v), &list); err == nil && len(list) > 0 {
+				for _, acc := range list {
+					if acc.Limiter == nil {
+						acc.Limiter = rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2)
+					}
+				}
+				c.accounts = list
+				return
+			}
+		}
+	}
+
+	// Migrate from legacy single-account settings or environment variables
+	email, password, token := c.getLegacyCredentials()
+	if email != "" || password != "" || token != "" {
+		b := make([]byte, 4)
+		_, _ = rand.Read(b)
+		acc := &Account{
+			ID:        "acc_" + hex.EncodeToString(b),
+			Email:     email,
+			Password:  password,
+			Token:     token,
+			CreatedAt: time.Now(),
+			Limiter:   rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
+		}
+		c.accounts = []*Account{acc}
+		if c.queries != nil {
+			_ = c.saveAccountsLocked()
+		}
+	}
+}
+
+func (c *Client) saveAccountsLocked() error {
+	if c.queries == nil {
+		return nil
+	}
+	data, err := json.Marshal(c.accounts)
+	if err != nil {
+		return err
+	}
+	return c.queries.SetSetting("arcod_accounts", string(data))
+}
+
+func (c *Client) autoCreateAccountLocked(ctx context.Context) (*Account, error) {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	randID := hex.EncodeToString(b)
+	email := fmt.Sprintf("crate_user_%s@example.com", randID)
+	password := fmt.Sprintf("CrateP@ss_%s!", randID)
+
+	baseURL := c.BaseURL()
+	tok, err := c.signup(ctx, baseURL, email, password)
+	if err != nil {
+		return nil, fmt.Errorf("auto-create arcod account failed: %w", err)
+	}
+
+	acc := &Account{
+		ID:        "acc_" + randID,
+		Email:     email,
+		Password:  password,
+		Token:     tok,
+		CreatedAt: time.Now(),
+		Limiter:   rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
+	}
+	c.accounts = append(c.accounts, acc)
+	_ = c.saveAccountsLocked()
+	return acc, nil
+}
+
+// AccountsCount returns the number of configured arcod accounts in the pool.
+func (c *Client) AccountsCount() int {
+	c.accountsMu.RLock()
+	defer c.accountsMu.RUnlock()
+	return len(c.accounts)
+}
+
+// ListAccounts returns sanitized information for all arcod accounts in the pool.
+func (c *Client) ListAccounts(ctx context.Context) []AccountInfo {
+	c.accountsMu.Lock()
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+	accounts := append([]*Account(nil), c.accounts...)
+	c.accountsMu.Unlock()
+
+	now := time.Now()
+	res := make([]AccountInfo, 0, len(accounts))
+	for _, acc := range accounts {
+		status := "active"
+		cooldownSec := 0
+		var rlUntil *time.Time
+
+		if acc.RateLimitedUntil.After(now) {
+			status = "rate_limited"
+			cooldownSec = int(acc.RateLimitedUntil.Sub(now).Seconds()) + 1
+			t := acc.RateLimitedUntil
+			rlUntil = &t
+		} else if acc.LastError != "" {
+			status = "error"
+		}
+
+		var lastUsed *time.Time
+		if !acc.LastUsedAt.IsZero() {
+			t := acc.LastUsedAt
+			lastUsed = &t
+		}
+
+		res = append(res, AccountInfo{
+			ID:               acc.ID,
+			Email:            acc.Email,
+			HasPassword:      acc.Password != "",
+			HasToken:         acc.Token != "",
+			CreatedAt:        acc.CreatedAt,
+			Status:           status,
+			RateLimitedUntil: rlUntil,
+			CooldownSeconds:  cooldownSec,
+			LastUsedAt:       lastUsed,
+			LastError:        acc.LastError,
+		})
+	}
+	return res
+}
+
+// AutoCreateAccount registers a new free account on arcod.xyz and adds it to the pool.
+func (c *Client) AutoCreateAccount(ctx context.Context) (*AccountInfo, error) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+	acc, err := c.autoCreateAccountLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &AccountInfo{
+		ID:          acc.ID,
+		Email:       acc.Email,
+		HasPassword: true,
+		HasToken:    acc.Token != "",
+		CreatedAt:   acc.CreatedAt,
+		Status:      "active",
+	}, nil
+}
+
+// AddAccount adds a manual account (with credentials or token) to the pool.
+func (c *Client) AddAccount(ctx context.Context, email, password, token string) (*AccountInfo, error) {
+	email = strings.TrimSpace(email)
+	password = strings.TrimSpace(password)
+	token = strings.TrimSpace(token)
+
+	if email == "" {
+		return nil, errors.New("email is required")
+	}
+
+	// Verify credentials or fetch token if password provided
+	if token == "" && password != "" {
+		tok, err := c.login(ctx, c.BaseURL(), email, password)
+		if err != nil {
+			return nil, fmt.Errorf("login verification failed: %w", err)
+		}
+		token = tok
+	}
+
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	acc := &Account{
+		ID:        "acc_" + hex.EncodeToString(b),
+		Email:     email,
+		Password:  password,
+		Token:     token,
+		CreatedAt: time.Now(),
+		Limiter:   rate.NewLimiter(rate.Every(defaultSearchRateLimit), 2),
+	}
+
+	c.accountsMu.Lock()
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+	c.accounts = append(c.accounts, acc)
+	_ = c.saveAccountsLocked()
+	c.accountsMu.Unlock()
+
+	return &AccountInfo{
+		ID:          acc.ID,
+		Email:       acc.Email,
+		HasPassword: acc.Password != "",
+		HasToken:    acc.Token != "",
+		CreatedAt:   acc.CreatedAt,
+		Status:      "active",
+	}, nil
+}
+
+// UpdateAccount updates an existing account in the pool.
+func (c *Client) UpdateAccount(ctx context.Context, id, email, password, token string) (*AccountInfo, error) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+
+	var target *Account
+	for _, acc := range c.accounts {
+		if acc.ID == id {
+			target = acc
+			break
+		}
+	}
+	if target == nil {
+		return nil, errors.New("account not found")
+	}
+
+	if strings.TrimSpace(email) != "" {
+		target.Email = strings.TrimSpace(email)
+	}
+	if strings.TrimSpace(password) != "" && password != "••••••••" {
+		target.Password = strings.TrimSpace(password)
+		target.Token = "" // Invalidate old token when password changes
+	}
+	if strings.TrimSpace(token) != "" && token != "••••••••" {
+		target.Token = strings.TrimSpace(token)
+	}
+
+	// If token missing and password available, test login
+	if target.Token == "" && target.Password != "" {
+		tok, err := c.login(ctx, c.BaseURL(), target.Email, target.Password)
+		if err == nil {
+			target.Token = tok
+			target.LastError = ""
+		} else {
+			target.LastError = err.Error()
+		}
+	}
+
+	_ = c.saveAccountsLocked()
+
+	return &AccountInfo{
+		ID:          target.ID,
+		Email:       target.Email,
+		HasPassword: target.Password != "",
+		HasToken:    target.Token != "",
+		CreatedAt:   target.CreatedAt,
+		Status:      "active",
+		LastError:   target.LastError,
+	}, nil
+}
+
+// DeleteAccount removes an account from the pool.
+func (c *Client) DeleteAccount(id string) error {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+
+	idx := -1
+	for i, acc := range c.accounts {
+		if acc.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("account not found")
+	}
+
+	c.accounts = append(c.accounts[:idx], c.accounts[idx+1:]...)
+	return c.saveAccountsLocked()
+}
+
+// TestAccount verifies an account's credentials against arcod.xyz.
+func (c *Client) TestAccount(ctx context.Context, id string) error {
+	c.accountsMu.Lock()
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+	var target *Account
+	for _, acc := range c.accounts {
+		if acc.ID == id {
+			target = acc
+			break
+		}
+	}
+	c.accountsMu.Unlock()
+
+	if target == nil {
+		return errors.New("account not found")
+	}
+
+	if target.Password == "" && target.Token == "" {
+		return errors.New("no password or token configured for account")
+	}
+
+	if target.Password != "" {
+		tok, err := c.login(ctx, c.BaseURL(), target.Email, target.Password)
+		if err != nil {
+			c.markAccountError(id, err.Error())
+			return fmt.Errorf("login failed: %w", err)
+		}
+		c.accountsMu.Lock()
+		target.Token = tok
+		target.LastError = ""
+		_ = c.saveAccountsLocked()
+		c.accountsMu.Unlock()
+	}
+
+	c.markAccountSuccess(id)
+	return nil
+}
+
+func (c *Client) getNextAvailableAccount(ctx context.Context) (*Account, error) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+
+	if len(c.accounts) == 0 {
+		c.loadAccountsLocked()
+	}
+	if len(c.accounts) == 0 {
+		if c.cachedToken != "" {
+			return &Account{ID: "legacy", Token: c.cachedToken}, nil
+		}
+		return nil, nil // No account configured
+	}
+
+	now := time.Now()
+	var available []*Account
+	var minCooldown time.Duration = -1
+
+	for _, acc := range c.accounts {
+		if acc.RateLimitedUntil.After(now) {
+			rem := acc.RateLimitedUntil.Sub(now)
+			if minCooldown < 0 || rem < minCooldown {
+				minCooldown = rem
+			}
+		} else {
+			available = append(available, acc)
+		}
+	}
+
+	if len(available) == 0 {
+		if minCooldown < 0 {
+			minCooldown = defaultRetryAfter
+		}
+		return nil, &RateLimitError{
+			RetryAfter: minCooldown,
+			Message:    fmt.Sprintf("all %d arcod accounts are rate limited (ready in %s)", len(c.accounts), minCooldown.Round(time.Second)),
+		}
+	}
+
+	// Pick least recently used among available accounts to distribute traffic evenly
+	best := available[0]
+	for _, acc := range available[1:] {
+		if acc.LastUsedAt.Before(best.LastUsedAt) {
+			best = acc
+		}
+	}
+
+	best.LastUsedAt = now
+	return best, nil
+}
+
+func (c *Client) markAccountRateLimited(accountID string, retryAfter time.Duration, msg string) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+	for _, acc := range c.accounts {
+		if acc.ID == accountID {
+			acc.RateLimitedUntil = time.Now().Add(retryAfter)
+			acc.LastError = msg
+			break
+		}
+	}
+}
+
+func (c *Client) markAccountError(accountID string, errStr string) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+	for _, acc := range c.accounts {
+		if acc.ID == accountID {
+			acc.LastError = errStr
+			break
+		}
+	}
+}
+
+func (c *Client) markAccountSuccess(accountID string) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+	for _, acc := range c.accounts {
+		if acc.ID == accountID {
+			acc.LastError = ""
+			break
+		}
+	}
+}
+
+func (c *Client) invalidateAccountToken(accountID string) {
+	c.accountsMu.Lock()
+	defer c.accountsMu.Unlock()
+	for _, acc := range c.accounts {
+		if acc.ID == accountID {
+			acc.Token = ""
+			_ = c.saveAccountsLocked()
+			break
+		}
+	}
+}
+
+func (c *Client) ensureAccountToken(ctx context.Context, acc *Account) (string, error) {
+	c.accountsMu.RLock()
+	tok := acc.Token
+	email := acc.Email
+	password := acc.Password
+	c.accountsMu.RUnlock()
+
+	if tok != "" {
+		return tok, nil
+	}
+
+	if email == "" || password == "" {
+		return "", errors.New("arcod account missing email or password")
+	}
+
+	newTok, err := c.login(ctx, c.BaseURL(), email, password)
+	if err != nil {
+		return "", fmt.Errorf("arcod login failed for %s: %w", email, err)
+	}
+
+	c.accountsMu.Lock()
+	acc.Token = newTok
+	_ = c.saveAccountsLocked()
+	c.accountsMu.Unlock()
+
+	return newTok, nil
+}
+
+// EnsureAuthenticated ensures a valid auth token is available from the pool.
 func (c *Client) EnsureAuthenticated(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -200,47 +670,38 @@ func (c *Client) EnsureAuthenticated(ctx context.Context) (string, error) {
 		return c.cachedToken, nil
 	}
 
-	email, password, token := c.getCredentials()
-	if token != "" {
-		c.cachedToken = token
-		return token, nil
-	}
-
-	baseURL := c.BaseURL()
-
-	// If email & password provided, log in
-	if email != "" && password != "" {
-		tok, err := c.login(ctx, baseURL, email, password)
-		if err == nil && tok != "" {
-			c.cachedToken = tok
-			if c.queries != nil {
-				_ = c.queries.SetSetting("arcod_token", tok)
-			}
-			return tok, nil
-		}
-		slog.Warn("arcod: login with credentials failed, attempting signup", "error", err)
-	}
-
-	// Auto-provision a free account if none exists
-	if email == "" {
-		b := make([]byte, 6)
-		_, _ = rand.Read(b)
-		randID := hex.EncodeToString(b)
-		email = fmt.Sprintf("crate_user_%s@example.com", randID)
-		password = fmt.Sprintf("CrateP@ss_%s!", randID)
-	}
-
-	tok, err := c.signup(ctx, baseURL, email, password)
+	acc, err := c.getNextAvailableAccount(ctx)
 	if err != nil {
-		return "", fmt.Errorf("arcod authentication failed: %w", err)
+		return "", err
+	}
+	if acc == nil {
+		// Attempt auto-provision
+		c.accountsMu.Lock()
+		newAcc, aErr := c.autoCreateAccountLocked(ctx)
+		c.accountsMu.Unlock()
+		if aErr != nil {
+			// Fallback to legacy single-account logic if pool is empty
+			email, password, token := c.getLegacyCredentials()
+			if token != "" {
+				c.cachedToken = token
+				return token, nil
+			}
+			if email != "" && password != "" {
+				if tok, lErr := c.login(ctx, c.BaseURL(), email, password); lErr == nil && tok != "" {
+					c.cachedToken = tok
+					return tok, nil
+				}
+			}
+			return "", aErr
+		}
+		acc = newAcc
 	}
 
-	c.cachedToken = tok
-	if c.queries != nil {
-		_ = c.queries.SetSetting("arcod_email", email)
-		_ = c.queries.SetSetting("arcod_password", password)
-		_ = c.queries.SetSetting("arcod_token", tok)
+	tok, err := c.ensureAccountToken(ctx, acc)
+	if err != nil {
+		return "", err
 	}
+	c.cachedToken = tok
 	return tok, nil
 }
 
@@ -314,39 +775,16 @@ func (c *Client) signup(ctx context.Context, baseURL, email, password string) (s
 	return res.Token, nil
 }
 
-// Search queries the arcod music API, pacing requests under arcod's 14/min rate limit
-// and honoring HTTP 429 retryAfterSeconds cooldowns across callers.
-func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) {
-	cacheKey := strings.ToLower(strings.TrimSpace(query))
-
-	c.rateMu.Lock()
-	if entry, ok := c.searchCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
-		items := append([]TrackItem(nil), entry.items...)
-		c.rateMu.Unlock()
-		return items, nil
-	}
-	if remaining := time.Until(c.rateLimitedUntil); remaining > 0 {
-		c.rateMu.Unlock()
-		return nil, &RateLimitError{
-			RetryAfter: remaining,
-			Message:    fmt.Sprintf("arcod search rate limit cooldown active (%s remaining)", remaining.Round(time.Second)),
-		}
-	}
-	limiter := c.searchLimiter
-	c.rateMu.Unlock()
-
-	if limiter != nil {
-		if err := limiter.Wait(ctx); err != nil {
-			return nil, err
-		}
-	}
-
+func (c *Client) doSearch(ctx context.Context, query string, token string) ([]TrackItem, error) {
 	baseURL := c.BaseURL()
 	searchURL := fmt.Sprintf("%s/api/get-music?q=%s", baseURL, url.QueryEscape(query))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -358,9 +796,6 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		b, _ := io.ReadAll(resp.Body)
 		retryAfter := parseRetryAfter(b, resp.Header.Get("Retry-After"))
-		c.rateMu.Lock()
-		c.rateLimitedUntil = time.Now().Add(retryAfter)
-		c.rateMu.Unlock()
 		return nil, &RateLimitError{
 			RetryAfter: retryAfter,
 			Message:    fmt.Sprintf("search failed (429): %s", strings.TrimSpace(string(b))),
@@ -408,7 +843,13 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 		})
 	}
 
+	return items, nil
+}
+
+func (c *Client) indexSearchResults(cacheKey string, items []TrackItem) {
 	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+
 	if c.searchCache == nil {
 		c.searchCache = make(map[string]cachedSearch)
 	}
@@ -428,8 +869,6 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 		expiresAt: time.Now().Add(defaultSearchCacheTTL),
 	}
 
-	// Index returned tracks into albumCache so other tracks in the same album
-	// can be retrieved instantly without burning search quota.
 	if c.albumCache == nil {
 		c.albumCache = make(map[string]cachedSearch)
 	}
@@ -453,9 +892,118 @@ func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) 
 			expiresAt: now.Add(defaultAlbumCacheTTL),
 		}
 	}
+}
+
+// Search queries the arcod music API, rotating across the account pool on 429 rate limits,
+// and indexing results for album-level caching.
+func (c *Client) Search(ctx context.Context, query string) ([]TrackItem, error) {
+	cacheKey := strings.ToLower(strings.TrimSpace(query))
+
+	c.rateMu.Lock()
+	if entry, ok := c.searchCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		items := append([]TrackItem(nil), entry.items...)
+		c.rateMu.Unlock()
+		return items, nil
+	}
+	if remaining := time.Until(c.rateLimitedUntil); remaining > 0 {
+		c.rateMu.Unlock()
+		return nil, &RateLimitError{
+			RetryAfter: remaining,
+			Message:    fmt.Sprintf("arcod search rate limit cooldown active (%s remaining)", remaining.Round(time.Second)),
+		}
+	}
 	c.rateMu.Unlock()
 
-	return items, nil
+	c.accountsMu.RLock()
+	accCount := len(c.accounts)
+	c.accountsMu.RUnlock()
+	if accCount == 0 {
+		c.accountsMu.Lock()
+		c.loadAccountsLocked()
+		accCount = len(c.accounts)
+		c.accountsMu.Unlock()
+	}
+
+	maxAttempts := accCount
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	triedAccounts := make(map[string]bool)
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		acc, err := c.getNextAvailableAccount(ctx)
+		var token string
+		accountID := ""
+		accountEmail := ""
+
+		if err != nil {
+			var rlErr *RateLimitError
+			if errors.As(err, &rlErr) {
+				return nil, err
+			}
+			// If account auto-provision isn't possible (e.g. test mock), try unauthenticated
+		} else if acc != nil {
+			if triedAccounts[acc.ID] {
+				break
+			}
+			triedAccounts[acc.ID] = true
+			accountID = acc.ID
+			accountEmail = acc.Email
+
+			if tok, tErr := c.ensureAccountToken(ctx, acc); tErr == nil && tok != "" {
+				token = tok
+			} else if tErr != nil {
+				c.markAccountError(acc.ID, tErr.Error())
+			}
+
+			if acc.Limiter != nil {
+				if wErr := acc.Limiter.Wait(ctx); wErr != nil {
+					return nil, wErr
+				}
+			} else if c.searchLimiter != nil {
+				if wErr := c.searchLimiter.Wait(ctx); wErr != nil {
+					return nil, wErr
+				}
+			}
+		}
+
+		items, err := c.doSearch(ctx, query, token)
+		if err == nil {
+			if accountID != "" {
+				c.markAccountSuccess(accountID)
+			}
+			c.indexSearchResults(cacheKey, items)
+			return items, nil
+		}
+
+		var rlErr *RateLimitError
+		if errors.As(err, &rlErr) {
+			if accountID != "" {
+				slog.Warn("arcod: account rate limited (429), rotating to next account",
+					"account_id", accountID, "email", accountEmail, "retry_after", rlErr.RetryAfter)
+				c.markAccountRateLimited(accountID, rlErr.RetryAfter, rlErr.Error())
+			} else {
+				c.rateMu.Lock()
+				c.rateLimitedUntil = time.Now().Add(rlErr.RetryAfter)
+				c.rateMu.Unlock()
+			}
+			lastErr = err
+			continue
+		}
+
+		return nil, err
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("arcod search failed: all accounts exhausted")
 }
 
 func parseRetryAfter(body []byte, headerVal string) time.Duration {
@@ -685,17 +1233,9 @@ func pickBestMatch(results []TrackItem, q MatchQuery) *TrackItem {
 	return best
 }
 
-// GetStreamURL retrieves the temporary audio stream URL for a track.
-func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (string, error) {
-	if quality <= 0 {
-		quality = DefaultQuality
-	}
+var errUnauthorized = errors.New("unauthorized")
 
-	token, err := c.EnsureAuthenticated(ctx)
-	if err != nil {
-		return "", err
-	}
-
+func (c *Client) doStreamRequest(ctx context.Context, trackID int64, quality int, token string) (string, error) {
 	baseURL := c.BaseURL()
 	streamURL := fmt.Sprintf("%s/api/player/stream/%d?quality=%d", baseURL, trackID, quality)
 
@@ -703,7 +1243,9 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -712,24 +1254,16 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		// Invalidate cached token and retry once
-		c.mu.Lock()
-		c.cachedToken = ""
-		c.mu.Unlock()
+		return "", errUnauthorized
+	}
 
-		newToken, err := c.EnsureAuthenticated(ctx)
-		if err != nil {
-			return "", err
+	if resp.StatusCode == http.StatusTooManyRequests {
+		b, _ := io.ReadAll(resp.Body)
+		retryAfter := parseRetryAfter(b, resp.Header.Get("Retry-After"))
+		return "", &RateLimitError{
+			RetryAfter: retryAfter,
+			Message:    fmt.Sprintf("stream rate limited (429): %s", strings.TrimSpace(string(b))),
 		}
-
-		reqRetry, _ := http.NewRequestWithContext(ctx, "GET", streamURL, nil)
-		reqRetry.Header.Set("Authorization", "Bearer "+newToken)
-		respRetry, err := c.httpClient.Do(reqRetry)
-		if err != nil {
-			return "", err
-		}
-		defer respRetry.Body.Close()
-		resp = respRetry
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -748,6 +1282,109 @@ func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (
 		return "", errors.New("empty stream URL returned from arcod")
 	}
 	return res.URL, nil
+}
+
+// GetStreamURL retrieves the temporary audio stream URL for a track, rotating through
+// accounts on rate limit (429) or token expiration (401).
+func (c *Client) GetStreamURL(ctx context.Context, trackID int64, quality int) (string, error) {
+	if quality <= 0 {
+		quality = DefaultQuality
+	}
+
+	c.accountsMu.RLock()
+	accCount := len(c.accounts)
+	c.accountsMu.RUnlock()
+	if accCount == 0 {
+		c.accountsMu.Lock()
+		c.loadAccountsLocked()
+		accCount = len(c.accounts)
+		c.accountsMu.Unlock()
+	}
+
+	maxAttempts := accCount
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	triedAccounts := make(map[string]bool)
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
+		acc, err := c.getNextAvailableAccount(ctx)
+		var token string
+		accountID := ""
+		accountEmail := ""
+
+		if err != nil {
+			var rlErr *RateLimitError
+			if errors.As(err, &rlErr) {
+				return "", err
+			}
+			if c.cachedToken != "" {
+				token = c.cachedToken
+			} else {
+				return "", err
+			}
+		} else if acc != nil {
+			if triedAccounts[acc.ID] {
+				break
+			}
+			triedAccounts[acc.ID] = true
+			accountID = acc.ID
+			accountEmail = acc.Email
+
+			tok, tErr := c.ensureAccountToken(ctx, acc)
+			if tErr != nil {
+				c.markAccountError(acc.ID, tErr.Error())
+				lastErr = tErr
+				continue
+			}
+			token = tok
+		}
+
+		streamURL, err := c.doStreamRequest(ctx, trackID, quality, token)
+		if err == nil {
+			if accountID != "" {
+				c.markAccountSuccess(accountID)
+			}
+			return streamURL, nil
+		}
+
+		// Handle 401 Unauthorized: re-login once
+		if errors.Is(err, errUnauthorized) {
+			if accountID != "" && acc != nil {
+				c.invalidateAccountToken(acc.ID)
+				if newTok, loginErr := c.ensureAccountToken(ctx, acc); loginErr == nil {
+					if retryURL, retryErr := c.doStreamRequest(ctx, trackID, quality, newTok); retryErr == nil {
+						c.markAccountSuccess(acc.ID)
+						return retryURL, nil
+					}
+				}
+			}
+		}
+
+		var rlErr *RateLimitError
+		if errors.As(err, &rlErr) {
+			if accountID != "" {
+				slog.Warn("arcod: account stream rate limited (429), rotating to next account",
+					"account_id", accountID, "email", accountEmail, "retry_after", rlErr.RetryAfter)
+				c.markAccountRateLimited(accountID, rlErr.RetryAfter, rlErr.Error())
+			}
+			lastErr = err
+			continue
+		}
+
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("arcod stream request failed: no available account")
 }
 
 // DownloadTrack downloads the highest available lossless FLAC audio into destPath.

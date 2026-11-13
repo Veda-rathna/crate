@@ -448,3 +448,197 @@ func TestFindBestTrackMatch_AlbumBatchCaching(t *testing.T) {
 	}
 }
 
+func TestMultiAccountRateLimitRotation(t *testing.T) {
+	var acc1Calls, acc2Calls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer token_acc1" {
+			acc1Calls.Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"success":false,"error":"Too many searches from this network (14/min).","retryAfterSeconds":60}`))
+			return
+		}
+		if auth == "Bearer token_acc2" {
+			acc2Calls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"data": map[string]any{
+					"tracks": map[string]any{
+						"total": 1,
+						"items": []map[string]any{
+							{
+								"id":                    999,
+								"title":                 "Rotated Track",
+								"duration":              210,
+								"maximum_bit_depth":     24,
+								"maximum_sampling_rate": 96.0,
+								"hires":                 true,
+								"streamable":            true,
+								"performer": map[string]any{
+									"name": "Test Artist",
+								},
+								"album": map[string]any{
+									"title": "Test Album",
+								},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	client := NewClient(nil, "")
+	client.SetHTTPClient(ts.Client())
+	client.SetSearchLimiter(rate.NewLimiter(rate.Inf, 1))
+	t.Setenv("CRATE_ARCOD_URL", ts.URL)
+
+	// Add Account 1 and Account 2
+	_, err := client.AddAccount(context.Background(), "user1@example.com", "", "token_acc1")
+	if err != nil {
+		t.Fatalf("failed to add account 1: %v", err)
+	}
+	_, err = client.AddAccount(context.Background(), "user2@example.com", "", "token_acc2")
+	if err != nil {
+		t.Fatalf("failed to add account 2: %v", err)
+	}
+
+	if client.AccountsCount() != 2 {
+		t.Fatalf("expected 2 accounts, got %d", client.AccountsCount())
+	}
+
+	// First search should hit Account 1, receive 429, rotate to Account 2, and succeed!
+	items, err := client.Search(context.Background(), "rotate-query")
+	if err != nil {
+		t.Fatalf("search expected to succeed via rotation, got error: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != 999 {
+		t.Fatalf("expected rotated track 999, got %+v", items)
+	}
+
+	if acc1Calls.Load() != 1 {
+		t.Errorf("expected 1 call on account 1 (rate limited), got %d", acc1Calls.Load())
+	}
+	if acc2Calls.Load() != 1 {
+		t.Errorf("expected 1 call on account 2 (succeeded), got %d", acc2Calls.Load())
+	}
+
+	// Verify Account 1 is in rate_limited status and Account 2 is active
+	list := client.ListAccounts(context.Background())
+	var acc1Info, acc2Info *AccountInfo
+	for i := range list {
+		if list[i].Email == "user1@example.com" {
+			acc1Info = &list[i]
+		}
+		if list[i].Email == "user2@example.com" {
+			acc2Info = &list[i]
+		}
+	}
+	if acc1Info == nil || acc1Info.Status != "rate_limited" {
+		t.Errorf("expected account 1 status 'rate_limited', got %+v", acc1Info)
+	}
+	if acc1Info.CooldownSeconds <= 0 {
+		t.Errorf("expected cooldown > 0s, got %d", acc1Info.CooldownSeconds)
+	}
+	if acc2Info == nil || acc2Info.Status != "active" {
+		t.Errorf("expected account 2 status 'active', got %+v", acc2Info)
+	}
+
+	// Subsequent search for a different query should immediately pick Account 2 (Account 1 in cooldown)
+	items2, err := client.Search(context.Background(), "another-query")
+	if err != nil {
+		t.Fatalf("subsequent search expected to succeed via account 2, got: %v", err)
+	}
+	if len(items2) != 1 {
+		t.Errorf("expected 1 item, got %d", len(items2))
+	}
+	if acc1Calls.Load() != 1 {
+		t.Errorf("expected account 1 NOT to be called again during cooldown, calls=%d", acc1Calls.Load())
+	}
+	if acc2Calls.Load() != 2 {
+		t.Errorf("expected account 2 to handle second search, got %d calls", acc2Calls.Load())
+	}
+}
+
+func TestAccountPoolManagement(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/signup":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"token":   "auto_generated_token_123",
+			})
+		case "/api/auth/login":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["password"] == "badpass" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "invalid password"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"token":   "logged_in_token_" + body["email"],
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(nil, "")
+	client.SetHTTPClient(ts.Client())
+	t.Setenv("CRATE_ARCOD_URL", ts.URL)
+
+	// 1. Auto-create multiple accounts (unlimited creation)
+	for i := 0; i < 5; i++ {
+		acc, err := client.AutoCreateAccount(context.Background())
+		if err != nil {
+			t.Fatalf("AutoCreateAccount #%d failed: %v", i, err)
+		}
+		if acc.ID == "" || acc.Email == "" || !acc.HasToken {
+			t.Fatalf("unexpected acc info: %+v", acc)
+		}
+	}
+
+	if client.AccountsCount() != 5 {
+		t.Fatalf("expected 5 accounts, got %d", client.AccountsCount())
+	}
+
+	// 2. Add manual account
+	manualAcc, err := client.AddAccount(context.Background(), "custom@domain.com", "mypass123", "")
+	if err != nil {
+		t.Fatalf("AddAccount failed: %v", err)
+	}
+	if client.AccountsCount() != 6 {
+		t.Fatalf("expected 6 accounts after manual add, got %d", client.AccountsCount())
+	}
+
+	// 3. Test account
+	if err := client.TestAccount(context.Background(), manualAcc.ID); err != nil {
+		t.Fatalf("TestAccount failed: %v", err)
+	}
+
+	// 4. Update account
+	updated, err := client.UpdateAccount(context.Background(), manualAcc.ID, "custom_updated@domain.com", "••••••••", "")
+	if err != nil {
+		t.Fatalf("UpdateAccount failed: %v", err)
+	}
+	if updated.Email != "custom_updated@domain.com" {
+		t.Errorf("expected updated email, got %s", updated.Email)
+	}
+
+	// 5. Delete account
+	if err := client.DeleteAccount(manualAcc.ID); err != nil {
+		t.Fatalf("DeleteAccount failed: %v", err)
+	}
+	if client.AccountsCount() != 5 {
+		t.Fatalf("expected 5 accounts after delete, got %d", client.AccountsCount())
+	}
+}
+
+

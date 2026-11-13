@@ -125,6 +125,10 @@ func (s *Service) SetArcod(a ArcodProvider) {
 	s.arcod = a
 }
 
+func (s *Service) Arcod() ArcodProvider {
+	return s.arcod
+}
+
 func (s *Service) SetDownloadsDir(dir string) {
 	s.downloadsDir = dir
 }

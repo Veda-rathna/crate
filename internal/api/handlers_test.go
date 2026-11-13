@@ -3110,3 +3110,100 @@ func TestSettingsLanguageOptionsAndSyncResolver(t *testing.T) {
 		t.Errorf("expected Telugu dub to be ignored for Tamil artist, got %s", tel.Status)
 	}
 }
+
+func TestArcodAccountsAPI(t *testing.T) {
+	fakeArcod := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/signup":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"token":   "auto_tok_12345",
+			})
+		case "/api/auth/login":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"token":   "logged_in_token_xyz",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fakeArcod.Close()
+
+	env := newTestEnv(t)
+	_ = env.queries.SetSetting("arcod_url", fakeArcod.URL)
+
+	// 1. Initial list
+	w := env.do("GET", "/api/settings/arcod/accounts", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d: %s", w.Code, w.Body.String())
+	}
+	var res struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+
+	// 2. Add manual account
+	w = env.do("POST", "/api/settings/arcod/accounts", `{"email":"test@arcod.com","password":"secretpassword"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("add status = %d: %s", w.Code, w.Body.String())
+	}
+	var created map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	accountID, ok := created["id"].(string)
+	if !ok || accountID == "" {
+		t.Fatalf("expected valid account id, got %+v", created)
+	}
+	if created["email"] != "test@arcod.com" {
+		t.Errorf("expected email test@arcod.com, got %v", created["email"])
+	}
+
+	// 3. Auto-create account
+	w = env.do("POST", "/api/settings/arcod/accounts/auto-create", "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("auto-create status = %d: %s", w.Code, w.Body.String())
+	}
+	var autoAcc map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &autoAcc)
+	autoID, ok := autoAcc["id"].(string)
+	if !ok || autoID == "" {
+		t.Fatalf("expected valid auto account id, got %+v", autoAcc)
+	}
+
+	// 4. Test account
+	w = env.do("POST", "/api/settings/arcod/accounts/"+accountID+"/test", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("test status = %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. Update account
+	w = env.do("PUT", "/api/settings/arcod/accounts/"+accountID, `{"email":"updated@arcod.com","password":"••••••••"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status = %d: %s", w.Code, w.Body.String())
+	}
+	var updated map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &updated)
+	if updated["email"] != "updated@arcod.com" {
+		t.Errorf("expected updated email, got %v", updated["email"])
+	}
+
+	// 6. Delete account
+	w = env.do("DELETE", "/api/settings/arcod/accounts/"+accountID, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status = %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify count reduced
+	w = env.do("GET", "/api/settings/arcod/accounts", "")
+	var afterList struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &afterList)
+	for _, a := range afterList.Accounts {
+		if a["id"] == accountID {
+			t.Errorf("expected account %s to be deleted, still found in list", accountID)
+		}
+	}
+}

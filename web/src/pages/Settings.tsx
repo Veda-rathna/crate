@@ -4,7 +4,9 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
 import { useSystemProcess } from '../context/SystemContext';
 import { useToast } from '../components/Toast';
-import { IconChevronRight, IconClose } from '../components/Icons';
+import ConfirmModal from '../components/ConfirmModal';
+import { IconChevronRight, IconClose, IconRefresh, IconTrash } from '../components/Icons';
+import type { ArcodAccount } from '../types/index';
 
 interface QualityTier {
   format: string;
@@ -78,25 +80,6 @@ const ARCOD_FIELDS: FieldDef[] = [
     label: 'Arcod URL',
     placeholder: 'https://arcod.xyz',
     description: 'Base URL for arcod lossless streaming service',
-  },
-  {
-    key: 'arcod_email',
-    label: 'Account Email',
-    placeholder: 'user@example.com',
-    description: 'Your arcod.xyz email for authentication',
-  },
-  {
-    key: 'arcod_password',
-    label: 'Account Password',
-    placeholder: 'Password',
-    type: 'password',
-  },
-  {
-    key: 'arcod_token',
-    label: 'Auth Token (Optional)',
-    placeholder: 'JWT Token',
-    type: 'password',
-    description: 'Direct Bearer token (auto-fetched if email/password provided)',
   },
 ];
 
@@ -248,6 +231,69 @@ export default function Settings() {
   const [saved, setSaved] = useState(false);
   const [newKeyword, setNewKeyword] = useState('');
   const [namingPreview, setNamingPreview] = useState<{ path?: string; error?: string }>({});
+
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [editingAccount, setEditingAccount] = useState<ArcodAccount | null>(null);
+  const [accountToDelete, setAccountToDelete] = useState<ArcodAccount | null>(null);
+  const [testingAccountId, setTestingAccountId] = useState<string | null>(null);
+
+  const { data: arcodAccountsData, refetch: refetchArcodAccounts } = useQuery({
+    queryKey: ['arcod-accounts'],
+    queryFn: () => api.listArcodAccounts(),
+  });
+  const arcodAccounts = arcodAccountsData?.accounts || [];
+
+  const autoCreateAccount = useMutation({
+    mutationFn: () => api.autoCreateArcodAccount(),
+    onSuccess: (acc) => {
+      refetchArcodAccounts();
+      toast(`Created account ${acc.email} on arcod.xyz!`, 'success');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const addAccount = useMutation({
+    mutationFn: (data: { email: string; password: string; token?: string }) =>
+      api.addArcodAccount(data),
+    onSuccess: () => {
+      refetchArcodAccounts();
+      toast('Arcod account added', 'success');
+      setAccountModalOpen(false);
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const updateAccount = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: { email?: string; password?: string; token?: string } }) =>
+      api.updateArcodAccount(id, data),
+    onSuccess: () => {
+      refetchArcodAccounts();
+      toast('Arcod account updated', 'success');
+      setEditingAccount(null);
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const deleteAccount = useMutation({
+    mutationFn: (id: string) => api.deleteArcodAccount(id),
+    onSuccess: () => {
+      refetchArcodAccounts();
+      toast('Account removed from pool', 'info');
+      setAccountToDelete(null);
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+  });
+
+  const testAccount = useMutation({
+    mutationFn: (id: string) => api.testArcodAccount(id),
+    onMutate: (id) => setTestingAccountId(id),
+    onSuccess: (res) => {
+      refetchArcodAccounts();
+      toast(res.message, 'success');
+    },
+    onError: (err: Error) => toast(err.message, 'error'),
+    onSettled: () => setTestingAccountId(null),
+  });
 
   const { data: settings } = useQuery({
     queryKey: ['settings'],
@@ -912,7 +958,7 @@ export default function Settings() {
                 />
               </button>
             </label>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="mb-4">
               {ARCOD_FIELDS.map((field) => (
                 <SettingInput
                   key={field.key}
@@ -921,6 +967,124 @@ export default function Settings() {
                   onChange={(v) => setForm({ ...form, [field.key]: v })}
                 />
               ))}
+            </div>
+
+            {/* Account Pool */}
+            <div className="space-y-3 pt-3 border-t border-white/[0.06]">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-semibold text-zinc-200">Account Pool</h4>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-zinc-800 text-zinc-300 border border-white/[0.08]">
+                      {arcodAccounts.length} account{arcodAccounts.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    When an account reaches the rate limit (14/min) or stream limit, Crate automatically rotates to the next available account.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={autoCreateAccount.isPending}
+                    onClick={() => autoCreateAccount.mutate()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-zinc-950 transition-colors disabled:opacity-50"
+                    title="Automatically register a free account on arcod.xyz"
+                  >
+                    <IconRefresh className={`w-3.5 h-3.5 ${autoCreateAccount.isPending ? 'animate-spin' : ''}`} />
+                    <span>{autoCreateAccount.isPending ? 'Creating…' : 'Auto-Create Free Account'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setAccountModalOpen(true)}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 border border-white/[0.08] text-zinc-200 transition-colors"
+                  >
+                    <span>+ Add Account</span>
+                  </button>
+                </div>
+              </div>
+
+              {arcodAccounts.length === 0 ? (
+                <div className="rounded-xl bg-zinc-950/60 border border-dashed border-white/[0.1] p-6 text-center space-y-2">
+                  <p className="text-sm font-medium text-zinc-300">No Arcod accounts configured</p>
+                  <p className="text-xs text-zinc-500 max-w-md mx-auto">
+                    Click &quot;Auto-Create Free Account&quot; to register a free account on arcod.xyz instantly, or &quot;Add Account&quot; to configure your own credentials.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {arcodAccounts.map((acc) => {
+                    const isRateLimited = acc.status === 'rate_limited';
+                    const isError = acc.status === 'error';
+                    const isTesting = testingAccountId === acc.id;
+
+                    return (
+                      <div
+                        key={acc.id}
+                        className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-zinc-950/60 border border-white/[0.06] rounded-xl p-3"
+                      >
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-sm font-medium text-zinc-100 truncate">{acc.email}</span>
+                            {isRateLimited ? (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                                Rate Limited ({acc.cooldown_seconds}s cooldown)
+                              </span>
+                            ) : isError ? (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                                Auth Error
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                                Active
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px] text-zinc-400">
+                            <span>Password: ••••••••</span>
+                            <span>·</span>
+                            <span>Token: {acc.has_token ? 'Verified' : 'Pending'}</span>
+                            {acc.last_error && isError && (
+                              <>
+                                <span>·</span>
+                                <span className="text-rose-400 truncate max-w-xs">{acc.last_error}</span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 self-end sm:self-auto shrink-0">
+                          <button
+                            type="button"
+                            disabled={isTesting}
+                            onClick={() => testAccount.mutate(acc.id)}
+                            className="px-2.5 py-1 rounded-lg text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors disabled:opacity-50"
+                          >
+                            {isTesting ? 'Testing…' : 'Test'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingAccount(acc)}
+                            className="px-2.5 py-1 rounded-lg text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setAccountToDelete(acc)}
+                            className="p-1.5 rounded-lg text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                            title="Remove account"
+                          >
+                            <IconTrash className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </SettingsSection>
 
@@ -1291,6 +1455,176 @@ export default function Settings() {
           </div>
         </div>
       )}
+
+      {/* Arcod Account Add/Edit Modal */}
+      <ArcodAccountModal
+        open={accountModalOpen || !!editingAccount}
+        account={editingAccount}
+        loading={addAccount.isPending || updateAccount.isPending}
+        onSave={(data) => {
+          if (editingAccount) {
+            updateAccount.mutate({ id: editingAccount.id, data });
+          } else {
+            addAccount.mutate({ email: data.email, password: data.password || '', token: data.token });
+          }
+        }}
+        onClose={() => {
+          setAccountModalOpen(false);
+          setEditingAccount(null);
+        }}
+      />
+
+      {/* Arcod Account Delete Modal */}
+      <ConfirmModal
+        open={!!accountToDelete}
+        title="Remove Arcod Account?"
+        description={
+          accountToDelete
+            ? `Remove ${accountToDelete.email} from the Arcod account pool? It will no longer be used for downloads.`
+            : ''
+        }
+        confirmLabel="Remove Account"
+        loading={deleteAccount.isPending}
+        onConfirm={() => {
+          if (accountToDelete) deleteAccount.mutate(accountToDelete.id);
+        }}
+        onCancel={() => setAccountToDelete(null)}
+      />
+    </div>
+  );
+}
+
+function ArcodAccountModal({
+  open,
+  account,
+  loading,
+  onSave,
+  onClose,
+}: {
+  open: boolean;
+  account: ArcodAccount | null;
+  loading: boolean;
+  onSave: (data: { email: string; password?: string; token?: string }) => void;
+  onClose: () => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [token, setToken] = useState('');
+
+  useEffect(() => {
+    if (account) {
+      setEmail(account.email || '');
+      setPassword('');
+      setToken('');
+    } else {
+      setEmail('');
+      setPassword('');
+      setToken('');
+    }
+  }, [account, open]);
+
+  if (!open) return null;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email.trim()) return;
+    const data: { email: string; password?: string; token?: string } = {
+      email: email.trim(),
+    };
+    if (password.trim()) data.password = password.trim();
+    if (token.trim()) data.token = token.trim();
+    onSave(data);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[95] flex items-end md:items-center justify-center md:p-4"
+      role="dialog"
+      aria-modal="true"
+      onClick={() => !loading && onClose()}
+    >
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-xs" />
+      <div
+        className="relative w-full md:max-w-md bg-zinc-900 border border-white/[0.08] rounded-t-2xl md:rounded-2xl shadow-2xl animate-slide-up md:animate-modal-in p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom,0px))] md:pb-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between pb-3 border-b border-white/[0.06]">
+          <h3 className="text-base font-semibold text-zinc-100">
+            {account ? 'Edit Arcod Account' : 'Add Arcod Account'}
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={loading}
+            className="text-zinc-500 hover:text-zinc-200 p-1 rounded-lg transition-colors"
+          >
+            <IconClose className="w-4 h-4" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4 pt-4">
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+              Account Email
+            </label>
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="user@example.com"
+              className="w-full bg-zinc-950 border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-amber-500/50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+              Account Password {account && <span className="text-zinc-500 font-normal">(leave blank to keep existing)</span>}
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+              className="w-full bg-zinc-950 border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-amber-500/50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+              Bearer Token (Optional)
+            </label>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Bearer token if known"
+              className="w-full bg-zinc-950 border border-white/[0.08] rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-amber-500/50"
+            />
+            <p className="text-[11px] text-zinc-500 mt-1">
+              If left blank, Crate will automatically fetch a token using your email and password.
+            </p>
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={loading}
+              className="px-4 py-2 rounded-xl text-sm font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={loading || !email.trim()}
+              className="px-5 py-2 rounded-xl text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-zinc-950 transition-colors disabled:opacity-50"
+            >
+              {loading ? 'Saving…' : account ? 'Update Account' : 'Add Account'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

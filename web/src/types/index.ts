@@ -278,3 +278,16 @@ export interface ImportState {
   report?: ImportReport;
   error?: string;
 }
+
+export interface ArcodAccount {
+  id: string;
+  email: string;
+  has_password: boolean;
+  has_token: boolean;
+  created_at: string;
+  status: 'active' | 'rate_limited' | 'error';
+  rate_limited_until?: string | null;
+  cooldown_seconds: number;
+  last_used_at?: string | null;
+  last_error?: string;
+}

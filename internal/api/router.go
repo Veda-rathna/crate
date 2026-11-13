@@ -16,17 +16,19 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/db"
 	"github.com/TheOutdoorProgrammer/crate/internal/language"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/importer"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/reject"
 )
 
 type Server struct {
-	queries      *db.Queries
-	providers    *provider.Manager
-	cache        *cache.Cache
-	downloader   *downloader.Service
-	activityLog  *activity.Log
+	queries        *db.Queries
+	providers      *provider.Manager
+	cache          *cache.Cache
+	downloader     *downloader.Service
+	arcodInstance  *arcod.Client
+	activityLog    *activity.Log
 	importer     *importer.Service
 	reject       *reject.Service
 	langResolver *language.Resolver
@@ -185,6 +187,15 @@ func (s *Server) setupRouter() chi.Router {
 			r.Get("/", s.handleGetSettings)
 			r.Put("/", s.handleUpdateSettings)
 			r.Get("/naming-preview", s.handleNamingPreview)
+
+			r.Route("/arcod", func(r chi.Router) {
+				r.Get("/accounts", s.handleListArcodAccounts)
+				r.Post("/accounts", s.handleAddArcodAccount)
+				r.Post("/accounts/auto-create", s.handleAutoCreateArcodAccount)
+				r.Put("/accounts/{id}", s.handleUpdateArcodAccount)
+				r.Delete("/accounts/{id}", s.handleDeleteArcodAccount)
+				r.Post("/accounts/{id}/test", s.handleTestArcodAccount)
+			})
 		})
 
 		r.Route("/library/import", func(r chi.Router) {

@@ -21,6 +21,7 @@ import (
 	"github.com/TheOutdoorProgrammer/crate/internal/naming"
 	"github.com/TheOutdoorProgrammer/crate/internal/provider"
 	"github.com/TheOutdoorProgrammer/crate/internal/releasedate"
+	"github.com/TheOutdoorProgrammer/crate/internal/services/arcod"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/downloader"
 	"github.com/TheOutdoorProgrammer/crate/internal/services/reject"
 	pb "github.com/TheOutdoorProgrammer/crate/proto/provider"
@@ -1572,6 +1573,7 @@ var hiddenSettings = map[string]bool{
 	"scan_interval":              true,
 	"download_format_preference": true,
 	"min_bitrate":                true,
+	"arcod_accounts":             true,
 }
 
 const redactedPlaceholder = "••••••••"
@@ -1666,6 +1668,109 @@ func (s *Server) handleNamingPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"path": path + ".flac"})
+}
+
+// Arcod Account Pool Handlers
+
+func (s *Server) arcodClient() *arcod.Client {
+	if s.downloader != nil {
+		if c, ok := s.downloader.Arcod().(*arcod.Client); ok && c != nil {
+			return c
+		}
+	}
+	if s.arcodInstance == nil {
+		s.arcodInstance = arcod.NewClient(s.queries, "")
+	}
+	return s.arcodInstance
+}
+
+func (s *Server) handleListArcodAccounts(w http.ResponseWriter, r *http.Request) {
+	accounts := s.arcodClient().ListAccounts(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts": accounts,
+	})
+}
+
+func (s *Server) handleAddArcodAccount(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	acc, err := s.arcodClient().AddAccount(r.Context(), req.Email, req.Password, req.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, acc)
+}
+
+func (s *Server) handleAutoCreateArcodAccount(w http.ResponseWriter, r *http.Request) {
+	acc, err := s.arcodClient().AutoCreateAccount(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, acc)
+}
+
+func (s *Server) handleUpdateArcodAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	acc, err := s.arcodClient().UpdateAccount(r.Context(), id, req.Email, req.Password, req.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, acc)
+}
+
+func (s *Server) handleDeleteArcodAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if err := s.arcodClient().DeleteAccount(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted"})
+}
+
+func (s *Server) handleTestArcodAccount(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if err := s.arcodClient().TestAccount(r.Context(), id); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"message": "Account login verified successfully",
+	})
 }
 
 // Library import
